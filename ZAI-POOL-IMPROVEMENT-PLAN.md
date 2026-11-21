@@ -3,6 +3,17 @@
 审查来源：GitHub main 分支静态审查（df2d7c8）。本文件记录每个问题的处置状态；
 修复以 tests/ 回归 + CI 通过为进入下一阶段的门槛。
 
+## Phase 4：性能、连接与资源管理（2026-11-22）
+
+| 计划项 | 处置 |
+|---|---|
+| 4.1 并发连接控制（max_connections/max_queued/max_sse_connections） | ✅ `BoundedServer`：活跃连接超限立即 503（不无限建线程）；SSE 独立配额占用/释放（跨 attempt 任何退出路径）；backlog 可配 |
+| 4.2 SSE 增量解析器 | ✅ `SSEUsageParser`：事件缓冲→行解析→usage 提取，跨 chunk 拼接、单 chunk 多事件、坏行忽略；协议字节原样透传（解析只读不改） |
+| 4.3 超时体系分离 | ✅ 非流式 `request_timeout` / 流式按块 `stream_idle_timeout`（read 抛 OSError 即终止）/ `connect_timeout`（TCP+TLS+代理握手），全部可配 |
+| 4.4 请求限流 | ✅ 内存令牌桶：全局限流 + 设备级限流，超限标准 429（`rate_limited_local`），**与账号 429 状态机完全隔离**（测试断言零冷却）；无 Redis 强依赖 |
+| 4.5 压力测试 | ✅ `tests/performance/bench.py`（json/sse/mixed，阶梯 1/10/25/50/100）：P50/P95/P99/RPS/错误率/槽位泄漏判定；CI 只跑轻量冒烟（`test_bench_smoke.py`），机器无关 |
+| 基线数据（本机，mock 上游） | 100 并发 SSE：0 错误 0 槽位泄漏，RPS≈1311，P99=29ms；真实上游数字待填 key 后复测 |
+
 ## 第二阶段：生产环境验收与稳定性收口（2026-11-22）
 
 | 项 | 处置 |

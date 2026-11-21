@@ -90,6 +90,108 @@ BILLING_BASE = "/api/v1/zcode-plan"
 # 换号也无益的客户端错误：原样透传，不进入冷却/熔断状态机
 PASS_THROUGH_STATUS = {400, 404, 405, 413, 422}
 MAX_BODY_BYTES = 32 * 1024 * 1024
+DEFAULT_SERVER = {
+    "max_connections": 100,      # 活跃连接上限（超限直接 503，不无限建线程）
+    "max_queued_requests": 50,   # listen backlog
+    "max_sse_connections": 30,   # SSE 独立配额（不被普通请求挤占，反之亦然）
+    "request_timeout": 300,      # 非流式上游读取超时（秒）
+    "stream_idle_timeout": 90,   # SSE 相邻数据块最大间隔（秒），超时即终止流
+    "connect_timeout": 20,       # 上游 TCP/TLS/代理握手超时（秒）
+    "max_body_bytes": MAX_BODY_BYTES,
+    "rate_limit_per_min": 0,     # 全局限流（次/分钟，0=关闭）
+    "device_rate_limit_per_min": 0,  # 设备级限流（次/分钟，0=关闭）
+}
+
+
+class TokenBucket:
+    """内存令牌桶（4.4）：rate_per_min=0 表示不限流。"""
+
+    def __init__(self, rate_per_min: float, capacity: float | None = None):
+        self.rate = rate_per_min / 60.0  # 每秒补充
+        self.capacity = capacity if capacity is not None else max(1.0, rate_per_min)
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+
+    def allow(self) -> bool:
+        if self.rate <= 0:
+            return True
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+
+class SSEUsageParser:
+    """SSE 增量解析器（4.2）：TCP chunk → 事件缓冲 → 行解析 → usage 提取。
+    不假设一次 read 就是完整行；协议字节由调用方原样透传，解析器只读不改。"""
+
+    def __init__(self):
+        self._buf = b""
+        self.tin: int | None = None
+        self.tout: int | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        self._buf += chunk
+        while b"\n" in self._buf:
+            raw, self._buf = self._buf.split(b"\n", 1)
+            self._line(raw.strip(b"\r"))
+
+    def _line(self, line: bytes) -> None:
+        if not line.startswith(b"data:"):
+            return
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            return
+        try:
+            u = (json.loads(payload.decode("utf-8", errors="replace")).get("usage") or {})
+        except Exception:
+            return
+        if u.get("prompt_tokens") is not None:
+            self.tin = int(u["prompt_tokens"])
+        if u.get("completion_tokens") is not None:
+            self.tout = int(u["completion_tokens"])
+
+
+class BoundedServer(ThreadingHTTPServer):
+    """4.1 有界服务器：活跃连接上限 + listen backlog 可配。超限立即 503，不建线程。"""
+
+    daemon_threads = True
+
+    def __init__(self, addr, handler, server_cfg: dict):
+        self.max_connections = int(server_cfg.get("max_connections", 100))
+        self.request_queue_size = int(server_cfg.get("max_queued_requests", 50))
+        self.max_sse_connections = int(server_cfg.get("max_sse_connections", 30))
+        self._conn_lock = threading.Lock()
+        self.active = 0
+        self.sse_active = 0
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        with self._conn_lock:
+            self.active += 1
+        if self.active > self.max_connections:
+            with self._conn_lock:
+                self.active -= 1
+            body = b'{"error":{"message":"connection limit exceeded"}}\n'
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Type: application/json\r\nConnection: close\r\n"
+                                + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._conn_lock:
+                self.active -= 1
 BILLING_APP_VERSION = "3.16.3"
 UA = "zai-pool/3.0"
 MODELS_PATH = UP_OPENAI_PATH + "/models"
@@ -237,8 +339,9 @@ def upstream_request(a: "Account", path: str, body: bytes = b"", extra: dict | N
     if extra:
         hdrs.update(extra)
     host = host or UPSTREAMS.get(a.realm, UPSTREAMS["global"])["host"]
+    connect_timeout = float((POOL.server_cfg if POOL else DEFAULT_SERVER).get("connect_timeout", 20))
     if a.proxy:
-        conn = UpstreamConn(open_tunnel(a.proxy, host=host), timeout=timeout)
+        conn = UpstreamConn(open_tunnel(a.proxy, host=host, timeout=int(connect_timeout)), timeout=timeout)
     elif a.sport_range and host == UP_HOST:
         conn = UpstreamConn(_bind_sport(a.sport_range), timeout=timeout)
     else:
@@ -357,8 +460,31 @@ class Pool:
                       "switch_reasons": {}}
         self.alert_cfg = cfg.get("alert") or {}
         self.admin_cfg = cfg.get("admin") or {}
+        self.server_cfg = dict(DEFAULT_SERVER)
+        self.server_cfg.update(cfg.get("server") or {})
+        self._global_bucket = TokenBucket(float(self.server_cfg.get("rate_limit_per_min", 0)))
+        self._device_buckets: dict[str, TokenBucket] = {}
         if not self.accounts:
             raise SystemExit("pool.json 没有有效账号")
+
+    def device_bucket(self, dev: "Device | None") -> TokenBucket | None:
+        """设备级限流桶；全局桶恒在。限流与账号 429 状态机完全隔离。"""
+        if dev is None:
+            return None
+        b = self._device_buckets.get(dev.name)
+        if b is None:
+            rate = float(self.server_cfg.get("device_rate_limit_per_min", 0))
+            b = TokenBucket(rate)
+            self._device_buckets[dev.name] = b
+        return b
+
+    def allow_request(self, dev: "Device | None") -> bool:
+        if not self._global_bucket.allow():
+            return False
+        b = self.device_bucket(dev)
+        if b and not b.allow():
+            return False
+        return True
 
     def device_by_key(self, key: str) -> Device | None:
         for d in self.devices:
@@ -1157,21 +1283,34 @@ class Handler(BaseHTTPRequestHandler):
         dev = POOL.device_by_key(auth) if auth else None
         if not dev and not self._authed():
             return self._json(401, {"error": "unauthorized"})
+        # 4.4 本地限流：超限 429，不触碰上游账号状态机
+        if not POOL.allow_request(dev):
+            return self._json(429, {"error": {"message": "local rate limit exceeded",
+                                              "type": "rate_limited_local"}})
         n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_BODY_BYTES:
-            return self._json(413, {"error": f"body too large: {n} > {MAX_BODY_BYTES}"})
+        max_body = int(POOL.server_cfg.get("max_body_bytes", MAX_BODY_BYTES))
+        if n > max_body:
+            return self._json(413, {"error": f"body too large: {n} > {max_body}"})
         try:
             req = json.loads(self.rfile.read(n) if n else b"{}")
         except Exception:
             return self._json(400, {"error": "bad json"})
         body = json.dumps(req).encode()
         stream = bool(req.get("stream"))
+        # 4.1 SSE 独立配额：占满即明确拒绝，不让长连接耗尽普通请求资源
+        srv = self.server
+        has_sse_quota = hasattr(srv, "sse_active")
+        if (stream and has_sse_quota
+                and srv.sse_active >= srv.max_sse_connections):
+            return self._json(503, {"error": {"message": "sse connection limit exceeded",
+                                              "type": "sse_limit_exceeded"}})
         sk = POOL.device_sticky_key(dev, sticky_key_of(req))
         tried: set[str] = set()
         last_err = None
         t0 = time.time()
         _seq[0] += 1
         seq = _seq[0]
+        sse_entered = False  # SSE 配额跨 attempt 释放标志
 
         for _ in range(max(1, POOL.max_retry)):
             # 原子租约：选号与槽位预留同一临界区，杜绝并发超卖
@@ -1188,9 +1327,12 @@ class Handler(BaseHTTPRequestHandler):
                 for h in ("anthropic-version", "anthropic-beta"):
                     if self.headers.get(h):
                         extra[h] = self.headers[h]
+            # 4.3 超时分离：非流式 request_timeout；流式 idle_timeout 按块生效
+            timeout = (float(POOL.server_cfg.get("stream_idle_timeout", 90)) if stream
+                       else float(POOL.server_cfg.get("request_timeout", 300)))
             try:
                 try:
-                    status, rh, resp = upstream_request(a, upstream_path, body, extra)
+                    status, rh, resp = upstream_request(a, upstream_path, body, extra, timeout=timeout)
                 except (OSError, http.client.HTTPException) as e:
                     POOL.note_unknown_fail(a)
                     last_err = f"{type(e).__name__}: {e}"
@@ -1229,28 +1371,26 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(raw)
                     self._reqlog(seq, req, "sync", 200, a, t0, tin, tout, dev)
                     return
+                # 4.1 SSE 配额占用（进入即计数，任何退出路径释放）
+                if has_sse_quota:
+                    srv.sse_active += 1
+                    sse_entered = True
                 self.send_response(200)
                 self.send_header("Content-Type", ctype or "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
+                parser = SSEUsageParser()
                 tin = tout = None
                 try:
                     while True:
-                        chunk = resp.read(1024)
+                        chunk = resp.read(1024)  # 流式空闲超时：read 抛 socket.timeout(OSError) 即终止
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
+                        self.wfile.write(chunk)   # 协议字节原样透传
                         self.wfile.flush()
-                        if b'"usage"' in chunk:
-                            try:
-                                for line in chunk.decode(errors="ignore").splitlines():
-                                    if line.startswith("data:") and '"usage"' in line:
-                                        u = json.loads(line[5:].strip()).get("usage") or {}
-                                        tin = int(u.get("prompt_tokens") or tin or 0)
-                                        tout = int(u.get("completion_tokens") or tout or 0)
-                            except Exception:
-                                pass
+                        parser.feed(chunk)        # 增量解析只读不改
+                        tin, tout = parser.tin, parser.tout
                 except (BrokenPipeError, OSError):
                     pass  # 客户端断开：槽位由外层 finally 释放
                 finally:
@@ -1266,6 +1406,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             finally:
                 a.in_flight -= 1
+                if sse_entered:
+                    sse_entered = False
+                    if has_sse_quota:
+                        srv.sse_active -= 1
         self._json(503, {"error": {"message": f"no available account; last={last_err}",
                                    "type": "zai_pool_exhausted"}})
         log(f"| #{seq} | {req.get('model')} | {'stream' if stream else 'sync'} | 503 | - | - |"
@@ -1551,7 +1695,7 @@ def main() -> int:
     load_panel()
 
     host, _, port = cfg.get("listen", "127.0.0.1:8602").rpartition(":")
-    srv = ThreadingHTTPServer((host or "0.0.0.0", int(port)), Handler)
+    srv = BoundedServer((host or "0.0.0.0", int(port)), Handler, POOL.server_cfg)
     srv.daemon_threads = False
 
     def _term(signum, frame):

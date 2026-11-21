@@ -1,26 +1,94 @@
 {
-  "listen": "127.0.0.1:8602",
-  "api_key": "必填：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\" 生成（<16 字符拒绝启动）",
-  "reset_hour": 9,
-  "strategy": "sticky-first",
-  "max_retry": 4,
-  "sticky_minutes": 30,
-  "admin": {"enabled": false, "audit_file": "admin_audit.log"},
-  "alert": {"enabled": false, "webhook_url": "", "secret": "", "min_healthy": 1, "interval_seconds": 30},
-  "billing": {"enabled": true, "interval_minutes": 10, "claim_hour": 9},
-  "accounts": [
-    {"name": "host",   "api_key": "账号1官方sk-key（z.ai 控制台）", "expires": "2026-11-22 09:00",
-     "sport_range": [50001, 50032],
-     "zcode_jwt": "可选：billing 自动巡检/领取用（zacc ident 档案里的 zcodejwttoken）",
-     "device_mid": "可选：~/.zcode/v2/telemetry-state.json 的 deviceMid"},
-    {"name": "ubuntu", "api_key": "账号2官方sk-key", "proxy": "socks5://user:pass@ip:1080"},
-    {"name": "kali",   "api_key": "账号3官方sk-key", "proxy": "http://user:pass@ip:8080", "max_in_flight": 4},
-    {"name": "winvm",  "api_key": "账号4官方sk-key", "sport_range": [50033, 50064]},
-    {"name": "cn",     "api_key": "国内号 bigmodel.cn 的 key", "realm": "cn"}
-  ],
-  "devices": [
-    {"name": "host",   "key": "每设备独立 key（>=12 字符）", "accounts": ["host", "cn"]},
-    {"name": "winvm",  "key": "dkp-winvm-xxxxx", "accounts": ["winvm"]},
-    {"name": "laptop", "key": "dkp-laptop-xxxxx", "accounts": []}
-  ]
+ "listen": "127.0.0.1:8602",
+ "api_key": "必填：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\" 生成（<16 字符拒绝启动）",
+ "reset_hour": 9,
+ "strategy": "sticky-first",
+ "max_retry": 4,
+ "sticky_minutes": 30,
+ "admin": {
+  "enabled": false,
+  "audit_file": "admin_audit.log"
+ },
+ "alert": {
+  "enabled": false,
+  "webhook_url": "",
+  "secret": "",
+  "min_healthy": 1,
+  "interval_seconds": 30
+ },
+ "billing": {
+  "enabled": true,
+  "interval_minutes": 10,
+  "claim_hour": 9
+ },
+ "accounts": [
+  {
+   "name": "host",
+   "api_key": "账号1官方sk-key（z.ai 控制台）",
+   "expires": "2026-11-22 09:00",
+   "sport_range": [
+    50001,
+    50032
+   ],
+   "zcode_jwt": "可选：billing 自动巡检/领取用（zacc ident 档案里的 zcodejwttoken）",
+   "device_mid": "可选：~/.zcode/v2/telemetry-state.json 的 deviceMid"
+  },
+  {
+   "name": "ubuntu",
+   "api_key": "账号2官方sk-key",
+   "proxy": "socks5://user:pass@ip:1080"
+  },
+  {
+   "name": "kali",
+   "api_key": "账号3官方sk-key",
+   "proxy": "http://user:pass@ip:8080",
+   "max_in_flight": 4
+  },
+  {
+   "name": "winvm",
+   "api_key": "账号4官方sk-key",
+   "sport_range": [
+    50033,
+    50064
+   ]
+  },
+  {
+   "name": "cn",
+   "api_key": "国内号 bigmodel.cn 的 key",
+   "realm": "cn"
+  }
+ ],
+ "devices": [
+  {
+   "name": "host",
+   "key": "每设备独立 key（>=12 字符）",
+   "accounts": [
+    "host",
+    "cn"
+   ]
+  },
+  {
+   "name": "winvm",
+   "key": "dkp-winvm-xxxxx",
+   "accounts": [
+    "winvm"
+   ]
+  },
+  {
+   "name": "laptop",
+   "key": "dkp-laptop-xxxxx",
+   "accounts": []
+  }
+ ],
+ "server": {
+  "max_connections": 100,
+  "max_queued_requests": 50,
+  "max_sse_connections": 30,
+  "request_timeout": 300,
+  "stream_idle_timeout": 90,
+  "connect_timeout": 20,
+  "max_body_bytes": 33554432,
+  "rate_limit_per_min": 0,
+  "device_rate_limit_per_min": 0
+ }
 }

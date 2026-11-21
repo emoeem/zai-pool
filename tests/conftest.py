@@ -69,7 +69,7 @@ def fake_upstream(monkeypatch, zp):
     def fake_upstream_req(a, path, body=b"", extra=None, method="POST", host=None, timeout=600):
         status, b, hdrs = script.pop(0) if script else (200, json.dumps({"usage": {"prompt_tokens": 1, "completion_tokens": 2}}), {})
         calls.append({"account": a.name, "path": path, "status": status,
-                      "headers": extra or {}, "method": method})
+                      "headers": extra or {}, "method": method, "timeout": timeout})
         return status, {k.lower(): v for k, v in hdrs.items()}, FakeResp(status, b, hdrs)
 
     monkeypatch.setattr(zp, "upstream_request", fake_upstream_req)
