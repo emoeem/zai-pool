@@ -31,3 +31,6 @@ bin
 cdp
 node_modules/
 *.asar
+
+# Phase 3 运行观察原始数据（聚合后入库）
+reports/runtime-observations.jsonl

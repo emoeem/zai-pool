@@ -281,6 +281,8 @@ class Account:
         self.last_picked = 0.0
         self.in_flight = 0
         self.usage: dict[str, dict] = {}
+        # 调度观测（3.3）：req/ok/fail 计数与最近错误（运行态，不持久化）
+        self.stats = {"req": 0, "ok": 0, "fail": 0, "err_last": ""}
         # billing 巡检结果
         self.billing: dict = {}
 
@@ -350,6 +352,9 @@ class Pool:
         self.sticky_min = float(cfg.get("sticky_minutes", 30))
         self.sticky: dict[str, tuple[str, float]] = {}
         self._primary: str | None = None
+        # 调度观测（3.3）
+        self.sched = {"sticky_hits": 0, "sticky_unbind": 0, "primary_switches": 0,
+                      "switch_reasons": {}}
         self.alert_cfg = cfg.get("alert") or {}
         self.admin_cfg = cfg.get("admin") or {}
         if not self.accounts:
@@ -391,12 +396,15 @@ class Pool:
                 name, until = ent
                 if time.time() > until:
                     self.sticky.pop(sticky_key, None)
+                    self.sched["sticky_unbind"] += 1
                 else:
                     for a in self.accounts:
                         if (a.name == name and a.available() and a.name not in exclude
                                 and in_scope(a)):
+                            self.sched["sticky_hits"] += 1
                             return a
                     self.sticky.pop(sticky_key, None)  # 失败解绑
+                    self.sched["sticky_unbind"] += 1
         alive = [a for a in self.accounts
                  if a.available() and a.name not in exclude and not a.exhausted()
                  and in_scope(a)]
@@ -424,6 +432,7 @@ class Pool:
             picked = max(cand, key=lambda a: w.get(a.name, 1.0) + random.random() * 0.3)
             if primary_name != picked.name:
                 log(f"[primary]{f' dev={dev.name}' if dev else ''} {picked.name}")
+                self.sched["primary_switches"] += 1
                 if dev:
                     dev.primary = picked.name
                 else:
@@ -506,6 +515,9 @@ class Pool:
         if until > a.cool_until:  # 不延长已有更长冷却（markFailure 语义）
             a.cool_until = until
             a.cool_reason = reason
+        self.sched["switch_reasons"][reason] = self.sched["switch_reasons"].get(reason, 0) + 1
+        a.stats["fail"] += 1
+        a.stats["err_last"] = f"{status}:{msg[:60]}"
         if self._primary == a.name and not a.healthy():
             self._primary = None
         for d in self.devices:
@@ -525,6 +537,7 @@ class Pool:
         a.fails = 0
         a.unknown_fails = 0
         a.last_used = time.time()
+        a.stats["ok"] += 1
         if a.breaker_until and a.breaker_until <= time.time():
             a.breaker_until = 0.0
             a.retry_count = 0
@@ -568,10 +581,20 @@ CFG_PATH = ""
 STATE_FILE = ""
 AUDIT_FILE = ""
 PANEL_HTML = "<html><body>panel not loaded</body></html>"
+_STATE_READONLY = False
+_RO_LAST_LOG = [0.0]
+
+
+def _save_fail_throttled(msg: str) -> None:
+    if time.time() - _RO_LAST_LOG[0] > 300:
+        _RO_LAST_LOG[0] = time.time()
+        log(f"[state] {msg}")
 
 
 def save_state() -> None:
-    if not STATE_FILE:
+    if not STATE_FILE or _STATE_READONLY:
+        if _STATE_READONLY:
+            _save_fail_throttled("状态文件只读保护中（损坏备份失败），跳过写盘")
         return
     # 1) 状态锁内做深拷贝快照（请求线程只短暂持锁）
     with _state_lock:
@@ -624,10 +647,28 @@ def _save_fail(e: OSError) -> None:
 def load_state() -> None:
     if not STATE_FILE or not Path(STATE_FILE).exists():
         return
+    raw = Path(STATE_FILE).read_bytes()
+    if not raw.strip():
+        log(f"[state] 状态文件为空（{STATE_FILE}），按全新状态启动；原文件保留为 .empty 标记")
+        try:
+            os.replace(STATE_FILE, STATE_FILE + ".empty")
+        except OSError:
+            pass
+        return
     try:
-        data = json.loads(Path(STATE_FILE).read_text())
+        data = json.loads(raw)
+        if not isinstance(data, dict) or "accounts" not in data:
+            raise ValueError("结构不识别：缺少 accounts 段")
     except Exception as e:
-        log(f"[state] 读取失败: {e}")
+        # 无法识别的状态：保留原文件 + 明确诊断，绝不静默覆盖（审查 3.2 要求）
+        bak = f"{STATE_FILE}.corrupt-{int(time.time())}"
+        try:
+            os.replace(STATE_FILE, bak)
+            log(f"[state] 状态文件损坏/不可识别（{e}），已原样保留为 {bak}，按全新状态启动")
+        except OSError as e2:
+            log(f"[state] 状态文件损坏且备份失败（{e} / {e2}）：后续写盘将被跳过以免覆盖原文件")
+            global _STATE_READONLY
+            _STATE_READONLY = True
         return
     by = {x["name"]: x for x in data.get("accounts", [])}
     now = time.time()
@@ -964,6 +1005,23 @@ def metrics_text() -> str:
     for d in POOL.devices:
         t = d.usage.get(today, {})
         lines.append(f'zaipool_device_tokens_out_total{{device="{d.name}"}} {t.get("out", 0)}')
+    lines.append("# HELP zaipool_sched_sticky_hits_total 粘性命中")
+    lines.append("# TYPE zaipool_sched_sticky_hits_total counter")
+    lines.append(f'zaipool_sched_sticky_hits_total {POOL.sched["sticky_hits"]}')
+    lines.append("# TYPE zaipool_sched_sticky_unbind_total 粘性解绑（失败/过期）")
+    lines.append("# TYPE zaipool_sched_sticky_unbind_total counter")
+    lines.append(f'zaipool_sched_sticky_unbind_total {POOL.sched["sticky_unbind"]}')
+    lines.append("# TYPE zaipool_sched_primary_switches_total 主用号切换")
+    lines.append("# TYPE zaipool_sched_primary_switches_total counter")
+    lines.append(f'zaipool_sched_primary_switches_total {POOL.sched["primary_switches"]}')
+    lines.append("# TYPE zaipool_sched_switch_reasons_total 切号原因计数")
+    lines.append("# TYPE zaipool_sched_switch_reasons_total counter")
+    for r, c in sorted(POOL.sched["switch_reasons"].items()):
+        lines.append(f'zaipool_sched_switch_reasons_total{{reason="{r}"}} {c}')
+    lines.append("# TYPE zaipool_account_requests_total counter")
+    for a in POOL.accounts:
+        lines.append(f'zaipool_account_requests_total{{account="{a.name}",result="ok"}} {a.stats["ok"]}')
+        lines.append(f'zaipool_account_requests_total{{account="{a.name}",result="fail"}} {a.stats["fail"]}')
     return "\n".join(lines) + "\n"
 
 
@@ -1049,6 +1107,7 @@ class Handler(BaseHTTPRequestHandler):
                 out.append({
                     "name": a.name, "reasons": a.state_reasons(),
                     "in_flight": a.in_flight,
+                    "stats": a.stats,
                     "exit": f"{p.scheme}://{p.hostname}:{p.port}" if p
                             else (f"sport {sr[0]}-{sr[1]}" if sr else "direct"),
                     "expires": a.expires,
@@ -1060,6 +1119,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"accounts": out, "reset_hour": POOL.reset_hour,
                                     "strategy": POOL.strategy, "primary": POOL._primary,
                                     "sticky_sessions": len(POOL.sticky),
+                                    "sched": dict(POOL.sched),
                                     "devices": self._devices_view()})
         if self.path == "/metrics":
             if not self._authed():
@@ -1122,6 +1182,7 @@ class Handler(BaseHTTPRequestHandler):
             if not a:
                 break
             tried.add(a.name)
+            a.stats["req"] += 1
             extra = {"Authorization": f"Bearer {a.key}"} if protocol == "openai" else {"x-api-key": a.key}
             if protocol == "anthropic":
                 for h in ("anthropic-version", "anthropic-beta"):
