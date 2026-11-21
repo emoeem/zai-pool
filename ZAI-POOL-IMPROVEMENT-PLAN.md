@@ -3,13 +3,26 @@
 审查来源：GitHub main 分支静态审查（df2d7c8）。本文件记录每个问题的处置状态；
 修复以 tests/ 回归 + CI 通过为进入下一阶段的门槛。
 
-## Phase 6 模块化（2026-11-22 首次尝试：回滚，推迟）
+## Phase 6 模块化（2026-11-22：try1 回滚 → try2 完成 core/storage 两域）
 
+### try1（首次尝试：整体回滚）
 - 尝试：AST 按顶层节点抽取 core 域（Account/Device/Pool/锁/桶/解析器/validate_security/UPSTREAMS）到 `zai_pool/core.py`
 - 结果：三轮补残留名称（MAX_BODY_BYTES/UPSTREAMS/模块名冲突 conftest 已修）后仍有 15 failed/27 errors——单文件内隐式耦合比预估深
 - 处置：**按 §6.2 纪律整体回滚**（行为零变化不可让步；观察期网关零影响），71 tests + 13 验收恢复绿
 - 保留成果：`tests/conftest.py` 模块注册名改为 `zp_entry`（消除与未来 `zai_pool` 包的命名冲突，下次迁移的前置修复）
-- 下次迁移前置条件：先把 zai-pool.py 内部按域加显式边界注释 + 为隐式共享名（MAX_BODY_BYTES/UPSTREAMS/BILLING_*）建立单一所有权，再机械搬运
+
+### try2（二次尝试：完成，本轮）
+- 前置条件完成项（try1 遗留，本轮先做后搬）：
+  - 主文件按域加显式边界注释：`# ==== domain: upstream / core / storage / billing / observability / http / entry ====` 七段
+  - 隐式共享名（MAX_BODY_BYTES/UPSTREAMS 族/BILLING_HOST/BILLING_BASE/BILLING_APP_VERSION）补单一所有权注释：一个归属域，他域只读引用、不得复制定义（BILLING_* 运行副本在 billing/client.py:12-14）
+  - conftest 模块名 `zp_entry`（try1 已修，本轮直接受益）
+- 本轮迁移结果：
+  - **core=done**：CST/now_cst/next_reset/log、UPSTREAMS 族、MAX_BODY_BYTES/DEFAULT_SERVER、TokenBucket、SSEUsageParser、Account/Device/Pool/_expires_ts、_state_lock/_sched_lock、DANGEROUS_KEYS/validate_security → `zai_pool/core.py`；主文件 re-export 回流，下游引用不变
+  - **storage=done**：save_state/load_state/audit/key_fp/_persist_lock/_STATE_READONLY/_save_fails → `zai_pool/storage.py`；`init_storage()` 以 getter 注入 POOL/STATE_FILE/AUDIT_FILE，保持"测试直接写 mod.STATE_FILE"路径兼容（tests/acceptance.py:87、tests/conftest.py:44 等）
+- 本轮 reverted：无（try1 回滚的 core 域在上述前置就位后成功落地，零行为变化）
+- 门禁（本机实测）：`pytest tests/` 71 passed + `tests/acceptance.py` 13/13；py_compile 三脚本+新包通过
+- 变更量：zai-pool.py -619/+50；新增 zai_pool/{__init__,core,storage}.py
+- 剩余域：upstream/billing/observability/http/entry 五段边界注释已就位，待后续轮次按同一纪律搬运
 
 ## Phase 4：性能、连接与资源管理（2026-11-22）
 

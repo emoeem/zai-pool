@@ -26,3 +26,12 @@
 ### 已知限制
 - zcode 客户端对话域（zcode-plan 对话端点）带签名 v4，不可第三方复刻——网关走官方 API Key 通道
 - 压测基线为 mock 上游数字；真实延迟待生产 key 注入后复测
+
+## [Unreleased]
+
+Phase 6 模块化 try2：try1 回滚的前置工程就位后重试，core / storage 两域抽离完成，单文件网关行为零变化。
+
+### 变更
+- 新增 `zai_pool/` 包：core 域（UPSTREAMS 族/DEFAULT_SERVER/TokenBucket/SSEUsageParser/Account/Device/Pool/状态机锁/安全闸）与 storage 域（save_state/load_state/audit/key_fp/落盘锁，`init_storage()` getter 注入）单一所有权迁入；zai-pool.py 经 re-export 回流保持调用点零改动（-619/+50 行）
+- 前置工程：主文件七段域边界注释（upstream/core/storage/billing/observability/http/entry）+ 隐式共享名（MAX_BODY_BYTES/UPSTREAMS 族/BILLING_*）单一所有权标注
+- 门禁：pytest 71 用例 + acceptance 13/13 全绿；剩余 upstream/billing/observability/http/entry 五域边界注释已就位待后续轮次
