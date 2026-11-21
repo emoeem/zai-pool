@@ -71,6 +71,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -86,12 +87,17 @@ UP_OPENAI_PATH = UPSTREAMS["global"]["openai"]
 UP_ANTHROPIC_PATH = UPSTREAMS["global"]["anthropic"]
 BILLING_HOST = "zcode.z.ai"
 BILLING_BASE = "/api/v1/zcode-plan"
+# 换号也无益的客户端错误：原样透传，不进入冷却/熔断状态机
+PASS_THROUGH_STATUS = {400, 404, 405, 413, 422}
+MAX_BODY_BYTES = 32 * 1024 * 1024
 BILLING_APP_VERSION = "3.16.3"
 UA = "zai-pool/3.0"
 MODELS_PATH = UP_OPENAI_PATH + "/models"
 PANEL_FILE = Path(__file__).resolve().parent / "zai-pool-panel.html"
 
 _state_lock = threading.Lock()
+_sched_lock = threading.Lock()   # 选号+租约临界区
+_persist_lock = threading.Lock()  # 落盘临界区（独立于状态锁，避免序列化阻塞请求）
 _ssl_ctx = ssl.create_default_context()
 _seq = [0]
 
@@ -112,18 +118,33 @@ def log(msg: str) -> None:
     print(f"[{now_cst().strftime('%m-%d %H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
-# ---------- 代理隧道（v2 延续） ----------
+# ---------- 代理隧道 ----------
+def _recv_exact(s: socket.socket, n: int) -> bytes:
+    """TCP 不保证单次 recv 返回全部字节；循环读满 n 字节。"""
+    buf = b""
+    while len(buf) < n:
+        c = s.recv(n - len(buf))
+        if not c:
+            raise OSError("proxy closed mid-handshake")
+        buf += c
+    return buf
+
+
 def open_tunnel(proxy: str, host: str = UP_HOST, port: int = 443,
                 timeout: int = 20, bind_port: int | None = None) -> socket.socket:
     u = urllib.parse.urlparse(proxy)
-    phost, pport = u.hostname, u.port or (8080 if u.scheme in ("http", "https") else 1080)
+    scheme = u.scheme.lower()
+    if scheme == "https":
+        # 未实现到代理本身的 TLS 握手，宁可拒绝也不静默降级
+        raise OSError("不支持 https:// 代理（未实现代理侧 TLS），请改用 http:// 或 socks5://")
+    phost, pport = u.hostname, u.port or (8080 if scheme == "http" else 1080)
     s = socket.socket()
     if bind_port:
         s.bind(("0.0.0.0", bind_port))
     s.settimeout(timeout)
     s.connect((phost, pport))
     creds = f"{u.username}:{u.password or ''}" if u.username else ""
-    if u.scheme in ("http", "https"):
+    if scheme == "http":
         req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
         if creds:
             req += f"Proxy-Authorization: Basic {base64.b64encode(creds.encode()).decode()}\r\n"
@@ -138,25 +159,39 @@ def open_tunnel(proxy: str, host: str = UP_HOST, port: int = 443,
         if " 200" not in line:
             raise OSError(f"proxy CONNECT failed: {line}")
         return s
-    if u.scheme in ("socks5", "socks5h"):
+    if scheme in ("socks5", "socks5h"):
         methods = b"\x02" if creds else b"\x00"
         s.sendall(b"\x05\x01" + methods)
-        r = s.recv(2)
+        r = _recv_exact(s, 2)
         if r[1] == 0xFF:
             raise OSError("socks5 no acceptable auth")
         if r[1] == 0x02:
-            s.sendall(b"\x01" + bytes([len(u.username)]) + u.username.encode()
-                      + bytes([len(u.password or "")]) + (u.password or "").encode())
-            r = s.recv(2)
+            ub = (u.username or "").encode()
+            pb = (u.password or "").encode()
+            s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
+            r = _recv_exact(s, 2)
             if r[1] != 0x00:
                 raise OSError("socks5 auth failed")
-        hb = socket.gethostbyname(host)
-        s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(hb) + struct.pack(">H", port))
-        r = s.recv(10)
-        if r[1] != 0x00:
-            raise OSError(f"socks5 connect failed rep={r[1] if len(r) > 1 else '?'}")
+        if scheme == "socks5h":
+            # 远程 DNS：域名按 ATYP=0x03 直接交给代理解析
+            hb = host.encode()
+            s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack(">H", port))
+        else:
+            hb = socket.gethostbyname(host)
+            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(hb) + struct.pack(">H", port))
+        head = _recv_exact(s, 4)
+        if head[1] != 0x00:
+            raise OSError(f"socks5 connect failed rep={head[1]}")
+        atyp = head[3]
+        if atyp == 0x01:
+            _recv_exact(s, 4 + 2)  # IPv4 + port
+        elif atyp == 0x03:
+            ln = _recv_exact(s, 1)[0]
+            _recv_exact(s, ln + 2)
+        elif atyp == 0x04:
+            _recv_exact(s, 16 + 2)
         return s
-    raise OSError(f"unsupported proxy scheme: {u.scheme}")
+    raise OSError(f"unsupported proxy scheme: {scheme}（支持 http:// socks5:// socks5h://）")
 
 
 def _bind_sport(rng: list[int] | tuple[int, int] | None) -> socket.socket | None:
@@ -346,7 +381,10 @@ class Pool:
         return w
 
     def pick(self, sticky_key: str, exclude: set[str], dev: "Device | None" = None) -> Account | None:
-        # 1) 会话粘性（五级键）
+        # 设备分配子集（无分配 = 全池）；粘性与主用号都必须过此过滤（设备隔离）
+        pool_names = set(dev.accounts) if dev and dev.accounts else None
+        in_scope = (lambda a: True) if pool_names is None else (lambda a: a.name in pool_names)
+        # 1) 会话粘性（五级键；键已含设备前缀，跨设备不冲突）
         if sticky_key:
             ent = self.sticky.get(sticky_key)
             if ent:
@@ -355,13 +393,13 @@ class Pool:
                     self.sticky.pop(sticky_key, None)
                 else:
                     for a in self.accounts:
-                        if a.name == name and a.available() and a.name not in exclude:
+                        if (a.name == name and a.available() and a.name not in exclude
+                                and in_scope(a)):
                             return a
                     self.sticky.pop(sticky_key, None)  # 失败解绑
-        pool_names = set(dev.accounts) if dev and dev.accounts else None
         alive = [a for a in self.accounts
                  if a.available() and a.name not in exclude and not a.exhausted()
-                 and (pool_names is None or a.name in pool_names)]
+                 and in_scope(a)]
         if not alive:
             return None
         now = time.time()
@@ -373,10 +411,10 @@ class Pool:
         primary_name = dev.primary if dev else self._primary
         # 3) 策略
         if self.strategy == "sticky-first":
-            # 主用号复用（设备级或池级）；失效重选
+            # 主用号复用（设备级或池级）；必须仍在分配子集内
             for a in self.accounts:
                 if (a.name == primary_name and a.available() and a.name not in exclude
-                        and not a.exhausted()):
+                        and not a.exhausted() and in_scope(a)):
                     a.last_picked = now
                     return a
             # 双段分配：新会话优先未被任何会话绑定的号
@@ -405,6 +443,22 @@ class Pool:
                 return a
         top[-1].last_picked = now
         return top[-1]
+
+    def device_sticky_key(self, dev: "Device | None", sticky_key: str) -> str:
+        """粘性键带设备命名空间：同首条消息的不同设备不互相串号。"""
+        return f"{dev.name}:{sticky_key}" if dev else sticky_key
+
+    def prune_sticky_for(self, dev: "Device") -> None:
+        """设备分配变更后：清掉该设备越界的粘性绑定与主用号。"""
+        prefix = f"{dev.name}:"
+        if not dev.accounts:
+            return
+        allowed = set(dev.accounts)
+        for k in [k for k, v in self.sticky.items()
+                  if k.startswith(prefix) and v[0] not in allowed]:
+            self.sticky.pop(k, None)
+        if dev.primary and dev.primary not in allowed:
+            dev.primary = None
 
     def bind(self, sticky_key: str, a: Account) -> None:
         if sticky_key:  # 成功重绑：粘性跟随最终成功号
@@ -519,25 +573,39 @@ PANEL_HTML = "<html><body>panel not loaded</body></html>"
 def save_state() -> None:
     if not STATE_FILE:
         return
+    # 1) 状态锁内做深拷贝快照（请求线程只短暂持锁）
     with _state_lock:
         data = {"saved_at": time.time(), "accounts": [], "devices": []}
         for a in POOL.accounts:
             data["accounts"].append({
-                "name": a.name, "usage": a.usage,
+                "name": a.name,
+                "usage": {k: dict(v) for k, v in a.usage.items()},
                 "cool_until": a.cool_until, "cool_reason": a.cool_reason,
                 "breaker_until": a.breaker_until, "retry_count": a.retry_count,
                 "manual_disabled": a.manual_disabled, "disabled": a.disabled,
-                "disabled_reason": a.disabled_reason, "billing": a.billing,
+                "disabled_reason": a.disabled_reason,
+                "billing": json.loads(json.dumps(a.billing)),
             })
         for d in POOL.devices:
-            data["devices"].append({"name": d.name, "usage": d.usage, "primary": d.primary})
-    tmp = STATE_FILE + ".tmp"
-    try:
-        Path(tmp).write_text(json.dumps(data, ensure_ascii=False, indent=1))
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, STATE_FILE)
-    except OSError as e:
-        _save_fail(e)
+            data["devices"].append({"name": d.name,
+                                    "usage": {k: dict(v) for k, v in d.usage.items()},
+                                    "primary": d.primary})
+    # 2) 持久化锁内写唯一临时文件 → fsync → 原子替换
+    with _persist_lock:
+        tmp = f"{STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, STATE_FILE)
+        except OSError as e:
+            _save_fail(e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 _save_fails = [0]
@@ -731,21 +799,20 @@ class Alerter:
         if bad:
             self.bad_ticks += 1
             self.good_ticks = 0
-            if self.state == "ok" and self.bad_ticks >= self.for_ticks:
+            # ok/pending 都可进入 firing：连续 for_ticks 次坏 tick 即触发（边沿触发只发一次）
+            if self.state in ("ok", "pending") and self.bad_ticks >= self.for_ticks:
                 self.state = "firing"
                 self._send(f"zai-pool: 健康账号数 {healthy}/{total} < {self.min_healthy}")
-            elif self.state == "pending":
-                pass
+            elif self.state == "ok":
+                self.state = "pending"
         else:
             self.good_ticks += 1
             self.bad_ticks = 0
             if self.state == "firing" and self.good_ticks >= self.clear_ticks:
                 self.state = "ok"
                 self._send(f"zai-pool: 已恢复 {healthy}/{total}")
-            elif self.state in ("pending",):
+            elif self.state == "pending" and self.good_ticks >= self.clear_ticks:
                 self.state = "ok"
-        if self.state == "ok" and bad and self.bad_ticks < self.for_ticks:
-            self.state = "pending"
 
     def _send(self, text: str) -> None:
         try:
@@ -809,11 +876,14 @@ def reload_config() -> None:
         merged = []
         for name, acfg in new_keys.items():
             if name in old and old[name].key == acfg["api_key"]:
-                a = old[name]  # 保留运行态
+                a = old[name]  # 保留运行态，但全部可热更字段同步
                 a.proxy = (acfg.get("proxy") or "").strip()
                 a.sport_range = acfg.get("sport_range")
                 a.expires = acfg.get("expires")
                 a.realm = acfg.get("realm", a.realm)
+                a.zcode_jwt = (acfg.get("zcode_jwt") or "").strip()
+                a.device_mid = (acfg.get("device_mid") or "").strip()
+                a.max_in_flight = int(acfg.get("max_in_flight", a.max_in_flight))
             else:
                 a = Account(acfg)
             merged.append(a)
@@ -827,10 +897,22 @@ def reload_config() -> None:
                 d.accounts = list(dcfg.get("accounts") or [])
             else:
                 d = Device(dcfg)
+            POOL.prune_sticky_for(d)
             merged_dev.append(d)
         POOL.devices = merged_dev
+        # 池级字段整体同步
         POOL.api_key = cfg.get("api_key", POOL.api_key)
-        log(f"[reload] accounts={len(merged)} devices={len(merged_dev)}")
+        POOL.cfg = cfg
+        POOL.strategy = cfg.get("strategy", POOL.strategy)
+        POOL.max_retry = int(cfg.get("max_retry", POOL.max_retry))
+        POOL.reset_hour = int(cfg.get("reset_hour", POOL.reset_hour))
+        POOL.sticky_min = float(cfg.get("sticky_minutes", POOL.sticky_min))
+        POOL.alert_cfg = cfg.get("alert") or POOL.alert_cfg
+        POOL.admin_cfg = cfg.get("admin") or POOL.admin_cfg
+        if ALERTER and cfg.get("alert"):
+            ALERTER.__init__(cfg["alert"])  # 告警配置热更
+        log(f"[reload] accounts={len(merged)} devices={len(merged_dev)} "
+            f"strategy={POOL.strategy} reset={POOL.reset_hour}")
     except Exception as e:
         log(f"[reload] 失败: {e}")
 
@@ -897,6 +979,7 @@ def load_panel() -> None:
 # ---------- HTTP Handler ----------
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 600  # 客户端连接空闲上限（SSE 兼容：读超时足够宽）
 
     def log_message(self, *a):
         pass
@@ -930,18 +1013,31 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if self.path == "/v1/models":
-            if not self._authed():
+            auth = (self.headers.get("Authorization") or "").replace("Bearer ", "").strip()
+            dev = POOL.device_by_key(auth) if auth else None
+            if not dev and not self._authed():
                 return self._json(401, {"error": "unauthorized"})
-            for acc in POOL.accounts:
-                if acc.available():
-                    try:
-                        status, _, resp = upstream_request(acc, MODELS_PATH, method="GET", timeout=30)
-                        raw = resp.read()
-                        return self._json(status, json.loads(raw) if status == 200 else {"error": raw.decode(errors="replace")[:300]})
-                    except Exception as e:
-                        last = str(e)
-                        continue
-            return self._json(502, {"error": f"no usable account for models; last={last if 'last' in dir() else '-'}"})
+            last = "-"
+            for _ in range(max(1, POOL.max_retry)):
+                with _sched_lock:
+                    acc = POOL.pick("", set(), dev=dev)
+                    if acc:
+                        acc.in_flight += 1
+                if not acc:
+                    break
+                try:
+                    status, _, resp = upstream_request(acc, MODELS_PATH, method="GET", timeout=30)
+                    raw = resp.read()
+                    if status == 200:
+                        return self._json(status, json.loads(raw))
+                    last = f"{status} {raw[:100].decode(errors='replace')}"
+                    if status in (401, 403, 429) or status >= 500:
+                        POOL.cooldown(acc, status, last)
+                except (OSError, http.client.HTTPException) as e:
+                    last = str(e)
+                finally:
+                    acc.in_flight -= 1
+            return self._json(502, {"error": f"no usable account for models; last={last}"})
         if self.path == "/status":
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
@@ -965,6 +1061,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "strategy": POOL.strategy, "primary": POOL._primary,
                                     "sticky_sessions": len(POOL.sticky),
                                     "devices": self._devices_view()})
+        if self.path == "/metrics":
+            if not self._authed():
+                return self._json(401, {"error": "unauthorized"})
+            raw = metrics_text().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        self._json(404, {"error": "not found"})
 
     def _devices_view(self) -> list[dict]:
         names = {a.name for a in POOL.accounts}
@@ -983,16 +1090,6 @@ class Handler(BaseHTTPRequestHandler):
                 "today": d.usage.get(now_cst().strftime("%Y-%m-%d"), {}),
             })
         return out
-        if self.path == "/metrics":
-            if not self._authed():
-                return self._json(401, {"error": "unauthorized"})
-            raw = metrics_text().encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.4")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-            return
         self._json(404, {"error": "not found"})
 
     def _relay(self, upstream_path: str, protocol: str):
@@ -1001,13 +1098,15 @@ class Handler(BaseHTTPRequestHandler):
         if not dev and not self._authed():
             return self._json(401, {"error": "unauthorized"})
         n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY_BYTES:
+            return self._json(413, {"error": f"body too large: {n} > {MAX_BODY_BYTES}"})
         try:
             req = json.loads(self.rfile.read(n) if n else b"{}")
         except Exception:
             return self._json(400, {"error": "bad json"})
         body = json.dumps(req).encode()
         stream = bool(req.get("stream"))
-        sk = sticky_key_of(req)
+        sk = POOL.device_sticky_key(dev, sticky_key_of(req))
         tried: set[str] = set()
         last_err = None
         t0 = time.time()
@@ -1015,12 +1114,19 @@ class Handler(BaseHTTPRequestHandler):
         seq = _seq[0]
 
         for _ in range(max(1, POOL.max_retry)):
-            a = POOL.pick(sk, tried, dev=dev)
+            # 原子租约：选号与槽位预留同一临界区，杜绝并发超卖
+            with _sched_lock:
+                a = POOL.pick(sk, tried, dev=dev)
+                if a:
+                    a.in_flight += 1
             if not a:
                 break
             tried.add(a.name)
             extra = {"Authorization": f"Bearer {a.key}"} if protocol == "openai" else {"x-api-key": a.key}
-            a.in_flight += 1
+            if protocol == "anthropic":
+                for h in ("anthropic-version", "anthropic-beta"):
+                    if self.headers.get(h):
+                        extra[h] = self.headers[h]
             try:
                 try:
                     status, rh, resp = upstream_request(a, upstream_path, body, extra)
@@ -1030,6 +1136,16 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if status != 200:
                     err = resp.read()[:400].decode(errors="replace")
+                    # 错误分类：请求本身有错（换号也无益）→ 原样透传客户端，不冷却账号
+                    if status in PASS_THROUGH_STATUS:
+                        raw = err.encode()
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        log(f"[passthru] {a.name} http={status} {err[:80]}")
+                        return
                     POOL.cooldown(a, status, err, rh)
                     if sk and status in (401, 403):
                         POOL.unbind(sk)
@@ -1157,7 +1273,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": f"未知账号: {missing}"})
             old = d.accounts
             d.accounts = [str(x) for x in new_accounts]
-            d.primary = None  # 子集变了，重选主用号
+            POOL.prune_sticky_for(d)  # 越界粘性/主用号清理（设备隔离兜底）
             save_state()
             audit("assign", name, "ok", key_fp(POOL.api_key or "-"),
                   f"{old} -> {d.accounts}")
@@ -1284,6 +1400,38 @@ def honk_rules(cfg: dict) -> str:
 
 # ---------- main ----------
 STOP = threading.Event()
+DANGEROUS_KEYS = {"", "zpool-local-change-me", "change_me", "change-me", "test_key",
+                  "your-api-key", "sk-xxx", "placeholder"}
+
+
+def validate_security(cfg: dict, cfg_path: str) -> None:
+    """启动安全闸：密钥强度 / 监听面 / 配置文件权限。不达标拒绝启动。"""
+    key = (cfg.get("api_key") or "").strip()
+    listen = cfg.get("listen", "127.0.0.1:8602")
+    loopback = listen.rsplit(":", 1)[0] in ("127.0.0.1", "localhost", "::1", "")
+    if key.lower() in DANGEROUS_KEYS:
+        raise SystemExit(
+            f"[security] api_key 为空或使用了模板默认值——拒绝启动。\n"
+            f"  生成强密钥：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\"\n"
+            f"  写入 {cfg_path} 的 api_key 字段后重启。")
+    if len(key) < 16:
+        raise SystemExit("[security] api_key 太短（<16 字符），拒绝启动；"
+                         "生成强密钥：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\"")
+    if not loopback:
+        log("[security] 监听非回环地址：请确保运行在可信局域网内，"
+            "公网部署必须置于 TLS 反代（如 caddy/nginx）之后")
+    for dev in cfg.get("devices") or []:
+        dk = (dev.get("key") or "").strip()
+        if not dk or len(dk) < 12:
+            raise SystemExit(f"[security] 设备 {dev.get('name')} 的 key 为空或太短（<12），拒绝启动")
+    st = os.stat(cfg_path)
+    if st.st_mode & 0o077:
+        log(f"[security] {cfg_path} 权限过宽（{oct(st.st_mode & 0o777)}）：含 API key，建议 chmod 600")
+        try:
+            os.chmod(cfg_path, 0o600)
+            log("[security] 已自动收紧为 600")
+        except OSError:
+            pass
 
 
 def main() -> int:
@@ -1298,9 +1446,13 @@ def main() -> int:
     a = ap.parse_args()
     CFG_PATH = a.config
     cfg = json.loads(Path(CFG_PATH).read_text())
+    # 安全闸：probe/honk-rules 等只读子命令也需要有效 key（请求会带它出站），但
+    # --probe 允许占位 key（自检就是来发现坏 key 的）→ 仅服务启动路径强制
     POOL = Pool(cfg)
     STATE_FILE = str(Path(CFG_PATH).with_name("pool-state.json"))
     load_state()
+    if not (a.probe or a.probe_chat or a.probe_ip or a.honk_rules or a.billing):
+        validate_security(cfg, CFG_PATH)
     if a.probe or a.probe_chat:
         rc = run_probe(a.probe_chat)
         probe_exit_ips()
@@ -1332,7 +1484,7 @@ def main() -> int:
     ALERTER = Alerter(POOL.alert_cfg)
     load_panel()
 
-    host, _, port = cfg.get("listen", "0.0.0.0:8602").rpartition(":")
+    host, _, port = cfg.get("listen", "127.0.0.1:8602").rpartition(":")
     srv = ThreadingHTTPServer((host or "0.0.0.0", int(port)), Handler)
     srv.daemon_threads = False
 

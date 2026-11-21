@@ -14,12 +14,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import secrets
 import subprocess
 import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+WEB_TOKEN = secrets.token_urlsafe(16)  # 每次启动随机；exec 类危险操作需此令牌
 
 ZACC = str(Path(__file__).resolve().parent / "zacc.py")
 
@@ -140,8 +144,8 @@ const avColor=n=>{let h=0;for(const c of n)h=(h*31+c.charCodeAt(0))>>>0;return A
 function toast(tx,ok=true){$('toast-tx').textContent=tx;$('toast-ic').textContent=ok?'✓':'✕';
   $('toast').className='show '+(ok?'ok':'err');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').className='',2600)}
 function log(s){$('out').textContent+= (s+'\n');$('out').scrollTop=1e9}
-async function api(path,body){
-  const o=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
+async function api(path,body,extraHeaders){
+  const o=body?{method:'POST',headers:{'Content-Type':'application/json',...(extraHeaders||{})},body:JSON.stringify(body)}:{};
   const r=await fetch(path,o);const j=await r.json().catch(()=>({error:'响应解析失败'}));
   if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));return j}
 
@@ -163,12 +167,24 @@ function render(){
       <div class="chips"><span class="chip fpd">${a.fp||'—'}</span><span class="chip">${a.size}B</span>${isBox?`<span class="chip box">📦 ${esc(boxName)}</span>`:''}</div>
       <div class="card-foot"><span class="time">${a.mtime}</span>
         <div class="ops">
-          <button onclick="act('use','${esc(a.name)}')">切换</button>
-          <button onclick="execDialog('${esc(a.name)}')">运行</button>
-          <button onclick="act('save','${esc(a.name)}')">保存</button>
-          <button onclick="showDetail('${esc(a.name)}')">详情</button>
-          <button class="danger" onclick="rmDialog('${esc(a.name)}')">删除</button>
+          <button data-act="use" data-name="${esc(a.name)}">切换</button>
+          <button data-act="run" data-name="${esc(a.name)}">运行</button>
+          <button data-act="save" data-name="${esc(a.name)}">保存</button>
+          <button data-act="detail" data-name="${esc(a.name)}">详情</button>
+          <button class="danger" data-act="rm" data-name="${esc(a.name)}">删除</button>
         </div></div></div>`}).join('')}
+/* 事件委托：账号名经 dataset 传递（data-* 自动 HTML 实体解码，不经 JS 字符串拼接，杜绝 XSS） */
+document.addEventListener('click',e=>{
+  const b=e.target.closest('[data-act]');
+  if(!b)return;
+  const n=b.dataset.name, act=b.dataset.act;
+  if(act==='use'||act==='save')act(act,n);
+  else if(act==='run')execDialog(n);
+  else if(act==='detail')showDetail(n);
+  else if(act==='rm')rmDialog(n);
+  else if(act==='pick')pickAcc(n);
+  else if(act==='rm-confirm'){closeModal();act('rm',n)}
+});
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 
 async function load(){
@@ -204,25 +220,28 @@ function execDialog(pref){
   openModal(`<h3>以账号运行命令</h3><p>独立数据目录运行，不切换当前登录。容器来源账号自动注入原 HOME。长命令输出请看终端。</p>
   <input id="m-cmd" class="mono" value="zcode --version" onkeydown="if(event.key=='Enter')doExec()">
   <div class="row" style="justify-content:flex-start;gap:6px;flex-wrap:wrap;margin-bottom:0">
-    ${DATA.accounts.map(a=>`<button data-pick="${esc(a.name)}" onclick="pickAcc('${esc(a.name)}')">${esc(a.name)}</button>`).join('')}
+    ${DATA.accounts.map(a=>`<button data-act="pick" data-name="${esc(a.name)}">${esc(a.name)}</button>`).join('')}
   </div>
   <div id="m-home" class="sub" style="margin-top:10px"></div>
   <div class="row"><button onclick="closeModal()">取消</button><button class="primary" onclick="doExec()">运行</button></div>`);
   execDialog.acc=init;
   pickAcc(init)}
-function pickAcc(n){execDialog.acc=n;document.querySelectorAll('[data-pick]').forEach(b=>{
-  b.style.borderColor=b.dataset.pick===n?'var(--acc)':'';b.style.color=b.dataset.pick===n?'var(--acc)':''});
+function pickAcc(n){execDialog.acc=n;document.querySelectorAll('[data-act="pick"]').forEach(b=>{
+  b.style.borderColor=b.dataset.name===n?'var(--acc)':'';b.style.color=b.dataset.name===n?'var(--acc)':''});
   const a=DATA.accounts.find(x=>x.name===n);
   const el=$('m-home');
   if(el)el.textContent=a&&a.home&&a.home!=='__HOME__'?`将注入 HOME=${a.home}`:''}
 async function doExec(){const c=$('m-cmd').value.trim();if(!c)return;
   closeModal();toast('运行中…',true);
-  try{const j=await api('/api/exec',{name:execDialog.acc,cmd:c});
+  try{
+    let tok=localStorage.getItem('zacc-web-token');
+    if(!tok){tok=prompt('启动令牌（见 zacc-web 启动输出 WEB_TOKEN）')||'';localStorage.setItem('zacc-web-token',tok)}
+    const j=await api('/api/exec',{name:execDialog.acc,cmd:c},{'X-Auth':tok});
     log(`[exec ${execDialog.acc}] $ ${c}\n${j.output||'(无输出)'}\nexit=${j.code}`);
     toast(`exit=${j.code}`,j.code===0)}catch(e){toast('exec 失败：'+e.message,false)}}
 
 function rmDialog(name){openModal(`<h3>删除档案</h3><p>确定删除 <b class="mono">${esc(name)}</b>？该档案保存的凭据文件将被移除，不可恢复。</p>
-  <div class="row"><button onclick="closeModal()">取消</button><button class="danger" onclick="closeModal();act('rm','${esc(name)}')">确认删除</button></div>`)}
+  <div class="row"><button onclick="closeModal()">取消</button><button class="danger" data-act="rm-confirm" data-name="${esc(name)}">确认删除</button></div>`)}
 
 function openFromHash(){const h=location.hash.slice(1);
   if(!h)return;
@@ -271,7 +290,23 @@ class Handler(BaseHTTPRequestHandler):
             })
         return self._json(404, {"error": "not found"})
 
+    def _same_origin(self) -> bool:
+        """CSRF 防护：POST 必须来自本地面板（Origin/Host 均为 127.0.0.1|localhost）。"""
+        origin = (self.headers.get("Origin") or "").lower()
+        host = (self.headers.get("Host") or "").lower()
+        for v in (origin, host):
+            if v and "127.0.0.1" not in v and "localhost" not in v:
+                return False
+        return True
+
     def do_POST(self):
+        if not self._same_origin():
+            return self._json(403, {"error": "cross-origin POST 已拒绝（CSRF 防护）"})
+        if self.path == "/api/exec":
+            if os.environ.get("ZACC_WEB_ALLOW_EXEC") != "1":
+                return self._json(403, {"error": "exec 功能默认关闭：如需开放，启动前 export ZACC_WEB_ALLOW_EXEC=1，并在面板输入启动令牌"})
+            if self.headers.get("X-Auth") != WEB_TOKEN:
+                return self._json(403, {"error": "X-Auth 启动令牌无效（见 zacc-web 启动输出）"})
         try:
             body = self._body()
         except Exception:
@@ -328,6 +363,7 @@ def main() -> int:
         return 1
     url = f"http://127.0.0.1:{a.port}"
     print(f"[zacc-web] {url}")
+    print(f"[zacc-web] WEB_TOKEN={WEB_TOKEN}   （仅「运行命令」功能需要；exec 默认关闭，export ZACC_WEB_ALLOW_EXEC=1 开放）")
     if not a.no_open:
         threading.Timer(0.4, lambda: webbrowser.open(url, new=2) or print(f"[zacc-web] 若浏览器未自动打开，请手动访问 {url}")).start()
     try:

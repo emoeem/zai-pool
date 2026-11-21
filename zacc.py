@@ -49,6 +49,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,14 @@ CRED_NAME = "credentials.json"
 PROVIDER_NAME = "provider_config.json"
 LAST_PROFILE = "_last"
 CURRENT_FILE = ".current"
+NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def sanitize_name(name: str) -> str:
+    """档案名白名单：字母/数字/下划线/中划线。杜绝路径穿越（../、绝对路径、分隔符）。"""
+    if not NAME_RE.match(name or ""):
+        die(f"非法档案名: {name!r}（只允许字母/数字/_/-，1-64 位）")
+    return name
 
 
 def live_cred() -> Path:
@@ -305,7 +314,7 @@ def key_masks(data: dict) -> str:
 
 
 def cmd_add(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc add <name> [--file F]")
+    name = sanitize_name(args[0] if args else die("用法: zacc add <name> [--file F]"))
     src = Path(args[args.index("--file") + 1]) if "--file" in args else live_cred()
     if not src.exists():
         die(f"源文件不存在: {src}")
@@ -319,7 +328,7 @@ def cmd_add(args: list[str]) -> int:
 
 
 def cmd_save(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc save <name>")
+    name = sanitize_name(args[0] if args else die("用法: zacc save <name>"))
     src = live_cred()
     if not src.exists():
         die(f"当前凭据不存在: {src}")
@@ -332,7 +341,7 @@ def cmd_save(args: list[str]) -> int:
 
 
 def cmd_use(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc use <name> [--keep-providers]")
+    name = sanitize_name(args[0] if args else die("用法: zacc use <name> [--keep-providers]"))
     keep_providers = "--keep-providers" in args
     dst = profile_cred(name)
     if not dst.exists():
@@ -368,7 +377,7 @@ def cmd_list(args: list[str]) -> int:
     rows: list[dict] = []
     if ACCOUNTS_DIR.exists():
         for prof in sorted(ACCOUNTS_DIR.iterdir()):
-            if not prof.is_dir() or prof.name == ".lock":
+            if not prof.is_dir() or not NAME_RE.match(prof.name):
                 continue
             pc = profile_cred(prof.name)
             if not pc.exists():
@@ -413,7 +422,7 @@ def cmd_current(_: list[str]) -> int:
 
 
 def cmd_show(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc show <name>")
+    name = sanitize_name(args[0] if args else die("用法: zacc show <name>"))
     pc = profile_cred(name)
     if not pc.exists():
         die(f"档案不存在: {pc}")
@@ -441,12 +450,12 @@ def infer_home(source: Path) -> str:
     s = str(source.resolve())
     marker = "/.zcode/v2/credentials.json"
     if s.endswith(marker):
-        return s[: -len(marker)] or HOME
-    return HOME
+        return s[: -len(marker)] or str(HOME)
+    return str(HOME)
 
 
 def cmd_ident(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc ident <name>")
+    name = sanitize_name(args[0] if args else die("用法: zacc ident <name>"))
     pc = profile_cred(name)
     if not pc.exists():
         die(f"档案不存在: {pc}")
@@ -479,13 +488,13 @@ def cmd_exec(args: list[str]) -> int:
 
 
 def cmd_where(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc where <name>")
+    name = sanitize_name(args[0] if args else die("用法: zacc where <name>"))
     print(profile_cred(name))
     return 0
 
 
 def cmd_rm(args: list[str]) -> int:
-    name = args[0] if args else die("用法: zacc rm <name>")
+    name = sanitize_name(args[0] if args else die("用法: zacc rm <name>"))
     d = ACCOUNTS_DIR / name
     if not d.is_dir():
         die(f"档案不存在: {d}")

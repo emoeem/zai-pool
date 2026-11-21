@@ -20,17 +20,33 @@
 ### 快速开始
 
 ```bash
-# 1. 每账号在控制台建 API Key，填 zai-pool-data/pool.json（模板 pool.example.json）
+# 1. 每账号在控制台建 API Key，填 pool.json（模板 pool.example.json）
+cp pool.example.json pool.json && $EDITOR pool.json
+#    api_key 必须 >=16 字符（模板默认值/空 key 拒绝启动），生成：
+python3 -c "import secrets; print('zpool-'+secrets.token_urlsafe(24))"
 # 2. 自检（零额度消耗；--probe-chat 消耗少量额度实测出话）
-python3 zai-pool.py --config zai-pool-data/pool.json --probe
-# 3. 启动
-python3 zai-pool.py --config zai-pool-data/pool.json
-# 4. 设备接入（设备 key 或全局 key）
+python3 zai-pool.py --config pool.json --probe
+# 3. 前台启动
+python3 zai-pool.py --config pool.json
+# 4. 设备接入（每设备用 devices[].key；accounts 为该设备可用的账号子集，[] = 全池）
 export OPENAI_BASE_URL=http://<主机IP>:8602/v1   OPENAI_API_KEY=<设备key>
 export ANTHROPIC_BASE_URL=http://<主机IP>:8602   ANTHROPIC_API_KEY=<设备key>
-# 5. systemd 常驻
-sudo cp zai-pool.service /etc/systemd/system/ && sudo systemctl enable --now zai-pool
 ```
+
+### systemd 常驻（部署路径与仓库内路径解耦）
+
+```bash
+sudo mkdir -p /opt/zai-pool
+sudo cp zai-pool.py zai-pool-panel.html pool.json /opt/zai-pool/
+sudo chmod 600 /opt/zai-pool/pool.json          # 含密钥，强制 600
+# 编辑 zai-pool.service：把 User=CHANGE_ME 换成你的用户名（路径默认 /opt/zai-pool）
+sudo cp zai-pool.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now zai-pool
+journalctl -u zai-pool -f                        # 每请求单行日志
+```
+
+安全约定：启动时强制校验 api_key 强度与设备 key；非回环监听会打印 TLS 反代提醒；
+`admin.enabled` 默认关闭；zacc-web 的 exec 功能默认关闭（双闸：环境变量 + 启动令牌）。
 
 ### 子命令
 
