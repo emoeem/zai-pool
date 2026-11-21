@@ -1,0 +1,33 @@
+# 凭据与运行态（绝不入库）
+zai-pool-data/pool.json
+zai-pool-data/pool-state.json
+zai-pool-data/admin_audit.log
+zai-pool-data/server.log
+zai-pool-data/honk-rules.dae
+zai-pool-data/*.log
+*-state.json
+*.log
+
+# zacc 本机数据
+accounts/
+config.yaml
+
+# 本机其它项目与本会话杂物
+_probe/
+zcode_reg/
+.serena/
+.zcode/
+zcmulti/
+app.py
+config.yaml
+accounts/
+__pycache__/
+*.pyc
+*.pkl
+*.png
+cap
+cap2
+bin
+cdp
+node_modules/
+*.asar

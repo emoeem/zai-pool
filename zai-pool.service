@@ -1,0 +1,22 @@
+[Unit]
+Description=zai-pool - Z.ai GLM multi-account gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ↓ 改成你的用户名；下同，把 /opt/zai-pool 换成你的部署目录（repo clone 位置）
+User=CHANGE_ME
+WorkingDirectory=/opt/zai-pool
+ExecStart=/usr/bin/python3 /opt/zai-pool/zai-pool.py --config /opt/zai-pool/pool.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+# 不设全局 WriteTimeout 保护 SSE；内存上限防泄漏
+MemoryMax=512M
+StandardOutput=append:/opt/zai-pool/server.log
+StandardError=append:/opt/zai-pool/server.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "listen": "0.0.0.0:8602",
+  "api_key": "zpool-local-CHANGE-ME",
+  "reset_hour": 9,
+  "strategy": "sticky-first",
+  "max_retry": 4,
+  "sticky_minutes": 30,
+  "admin": {"enabled": true, "audit_file": "admin_audit.log"},
+  "alert": {"enabled": false, "webhook_url": "", "secret": "", "min_healthy": 1, "interval_seconds": 30},
+  "billing": {"enabled": true, "interval_minutes": 10, "claim_hour": 9},
+  "accounts": [
+    {"name": "host",   "api_key": "账号1官方sk-key", "expires": "2026-11-22 09:00",
+     "sport_range": [50001, 50032],
+     "zcode_jwt": "可选：zacc ident 档案里的 zcodejwttoken（billing 自动巡检/领取用）",
+     "device_mid": "可选：~/.zcode/v2/telemetry-state.json 的 deviceMid"},
+    {"name": "ubuntu", "api_key": "账号2官方sk-key", "proxy": "socks5://user:pass@ip:1080"},
+    {"name": "kali",   "api_key": "账号3官方sk-key", "proxy": "http://user:pass@ip:8080", "max_in_flight": 4},
+    {"name": "winvm",  "api_key": "账号4官方sk-key", "sport_range": [50033, 50064]},
+    {"name": "acct5",  "api_key": "账号5官方sk-key"}
+  ]
+}

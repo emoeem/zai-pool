@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>zai-pool · GLM 多账号网关</title>
+<style>
+:root{
+  --bg:#0b0e14; --panel:#12161f; --card:#171c27; --card-h:#1d2330;
+  --line:#232a38; --txt:#e6eaf2; --dim:#8b94a7; --faint:#5b6373;
+  --acc:#6c8cff; --acc2:#22d3ee; --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --grad:linear-gradient(135deg,#6c8cff,#22d3ee);
+  --r:14px; --mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
+  min-height:100vh;background-image:radial-gradient(900px 500px at 85% -10%,rgba(108,140,255,.13),transparent),radial-gradient(700px 400px at -10% 110%,rgba(34,211,238,.09),transparent)}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 24px 48px}
+header{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+.logo{width:42px;height:42px;border-radius:12px;background:var(--grad);display:grid;place-items:center;font-weight:800;font-size:16px;color:#fff;box-shadow:0 6px 20px rgba(108,140,255,.35)}
+h1{font-size:20px;font-weight:700}
+.sub{color:var(--dim);font-size:12.5px}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:18px 0 20px;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:7px 14px;font-size:13px}
+.badge b{font-weight:600}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.off{background:var(--faint);box-shadow:none}
+.actions{display:flex;gap:10px;flex-wrap:wrap}
+button{cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--txt);border-radius:10px;padding:8px 15px;font-size:13px;font-weight:500;transition:.15s}
+button:hover{background:var(--card-h);border-color:#2f394d;transform:translateY(-1px)}
+button.primary{background:var(--grad);border:none;color:#fff;font-weight:600}
+button.danger{color:var(--bad)} button.danger:hover{border-color:rgba(248,113,113,.5);background:rgba(248,113,113,.08)}
+button.ghost{background:transparent}
+.spin{width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:sp .7s linear infinite;display:none}
+@keyframes sp{to{transform:rotate(360deg)}} .busy .spin{display:inline-block}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px;transition:.15s}
+.card:hover{background:var(--card-h);transform:translateY(-2px);box-shadow:0 10px 28px rgba(0,0,0,.35)}
+.card.healthy{border-color:rgba(52,211,153,.45)}
+.card.down{border-color:rgba(248,113,113,.4)}
+.card-top{display:flex;align-items:center;gap:10px}
+.avatar{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font-weight:700;color:#fff;flex:none}
+.pname{font-weight:600;font-size:15px;display:flex;gap:8px;align-items:center;min-width:0}
+.tag{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:999px;flex:none}
+.tag.primary{background:rgba(108,140,255,.15);color:var(--acc);border:1px solid rgba(108,140,255,.35)}
+.tag.st{font-size:10.5px}
+.reasons{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 4px}
+.r{font-size:11px;padding:2px 8px;border-radius:6px;font-family:var(--mono);background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--dim)}
+.r.ok{color:var(--ok);border-color:rgba(52,211,153,.3)}
+.r.bad{color:var(--bad);border-color:rgba(248,113,113,.3)}
+.r.warn{color:var(--warn);border-color:rgba(251,191,36,.3)}
+.meta{color:var(--dim);font-size:12.5px;margin:4px 0;line-height:1.7}
+.meta b{color:var(--txt);font-weight:600}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px}
+.chip{font-family:var(--mono);font-size:11px;color:var(--faint);background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:6px;padding:2px 7px}
+.chip.acc{color:var(--acc2)}
+.bar{height:7px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden;margin:6px 0 12px}
+.bar>i{display:block;height:100%;background:var(--grad);border-radius:99px}
+.ops{display:flex;gap:6px;flex-wrap:wrap}
+.ops button{padding:5px 10px;font-size:12px;border-radius:8px;white-space:nowrap}
+.log{margin-top:26px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.log-head{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line);color:var(--dim);font-size:12px}
+.log pre{padding:14px 16px;font-family:var(--mono);font-size:12px;color:#a8b3c7;white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto;min-height:60px}
+#toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--panel);border:1px solid var(--line);padding:11px 20px;border-radius:12px;font-size:13.5px;box-shadow:0 12px 32px rgba(0,0,0,.5);transition:.3s;z-index:99}
+#toast.show{transform:translateX(-50%) translateY(0)}
+#toast.ok{border-color:rgba(52,211,153,.5)} #toast.err{border-color:rgba(248,113,113,.5)}
+</style></head><body>
+<div class="wrap">
+<header>
+  <div class="logo">zp</div>
+  <div><h1>zai-pool · GLM 多账号网关</h1>
+  <div class="sub">官方 API Key 通道 · sticky-first 调度 · billing 自动巡检/领取 · 127.0.0.1 或局域网</div></div>
+</header>
+<div class="topbar">
+  <div class="badge"><span class="dot off" id="dot"></span>主用号 <b id="primary">…</b>
+    <span style="color:var(--faint)">|</span> 今日 out <b id="tout">0</b> tokens
+    <span style="color:var(--faint)">|</span> sticky <b id="sticky">0</b>
+    <span style="color:var(--faint)">|</span> 策略 <b id="strategy">-</b></div>
+  <div class="actions">
+    <button id="btn-refresh" onclick="load()"><span class="spin"></span>刷新</button>
+    <button class="ghost" onclick="actAdmin('billing')">▶ 巡检+领取</button>
+  </div>
+</div>
+<div class="grid" id="grid"></div>
+<h2 style="margin:26px 0 12px;font-size:16px">接入设备</h2>
+<div class="grid" id="dgrid"></div>
+<div class="log"><div class="log-head"><span>账号台账 / 操作</span>
+  <span class="mono" id="gen">GET /status</span></div>
+<pre id="out">就绪。管理操作经 /admin（需 admin.enabled=true）。</pre></div>
+</div>
+<div id="toast"><span id="toast-tx"></span></div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+const AV=['#6c8cff','#22d3ee','#34d399','#fbbf24','#f87171','#a78bfa','#fb923c'];
+const avColor=n=>{let h=0;for(const c of n)h=(h*31+c.charCodeAt(0))>>>0;return AV[h%AV.length]};
+function toast(tx,ok=true){$('toast-tx').textContent=tx;$('toast').className='show '+(ok?'ok':'err');
+  clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').className='',2600)}
+async function api(p,opts){const r=await fetch(p,opts);return{status:r.status,body:await r.text()}}
+function fmtTok(x){return x==null?'-':(x>=1e6?(x/1e6).toFixed(2)+'M':x>=1e3?(x/1e3).toFixed(1)+'k':x)}
+
+function render(st){
+  const accts=st.accounts||[];
+  $('primary').textContent=st.primary||'未定';
+  $('sticky').textContent=st.sticky_sessions??0;
+  $('strategy').textContent=st.strategy||'-';
+  $('tout').textContent=fmtTok(accts.reduce((s,a)=>s+((a.today||{}).out||0),0));
+  $('dot').className='dot'+(accts.some(a=>(a.reasons||[]).includes('healthy'))?'':' off');
+  const g=$('grid');
+  if(!accts.length){g.innerHTML='<div class="card">（暂无账号，检查 pool.json）</div>';return}
+  g.innerHTML=accts.map(a=>{
+    const healthy=(a.reasons||[]).includes('healthy');
+    const reasons=(a.reasons||[]).map(r=>`<span class="r ${r.includes('healthy')?'ok':(r.includes('manual')||r.includes('disabled')||r.includes('cooling')?'bad':'warn')}">${esc(r)}</span>`).join('');
+    const b=(a.billing&&a.billing.balances)||[];
+    const tot=b.reduce((s,x)=>s+(x.total_units||0),0), rem=b.reduce((s,x)=>s+(x.remaining_units||0),0);
+    const pct=tot>0?Math.max(0,Math.min(100,rem/tot*100)):null;
+    const today=a.today||{};
+    return `<div class="card ${healthy?'healthy':(a.reasons.some(r=>r.includes('cooling')||r.includes('disabled'))?'down':'')}">
+      <div class="card-top">
+        <div class="avatar" style="background:${avColor(a.name)}">${esc(a.name.slice(0,1).toUpperCase())}</div>
+        <div class="pname"><span>${esc(a.name)}</span>${a.primary?'<span class="tag primary">PRIMARY</span>':''}
+        ${a.has_jwt?'<span class="tag st r ok">JWT</span>':''}</div></div>
+      <div class="reasons">${reasons}</div>
+      <div class="meta">出口 <b>${esc(a.exit||'direct')}</b> · 过期 <b>${esc(a.expires||'-')}</b>
+        · 今日 <b>${fmtTok(today.in)}</b> in / <b>${fmtTok(today.out)}</b> out · 在途 <b>${a.in_flight}</b></div>
+      ${pct!=null?`<div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="meta">billing 剩余 <b>${fmtTok(rem)}</b> / ${fmtTok(tot)}（巡检）</div>`:'<div class="meta" style="color:var(--faint)">（无 billing 数据：未配 zcode_jwt/device_mid）</div>'}
+      <div class="ops">
+        <button class="danger" onclick="admin('${esc(a.name)}','disable')">停用</button>
+        <button onclick="admin('${esc(a.name)}','enable')">恢复</button>
+        <button onclick="admin('${esc(a.name)}','revive')">复活</button>
+      </div></div>`}).join('')}
+  const dg=$('dgrid');
+  const devs=st.devices||[];
+  if(!devs.length){dg.innerHTML='<div class="card" style="color:var(--dim)">（无设备：pool.json 加 devices:[{name,key,accounts}] 后热重载生效）</div>';return}
+  dg.innerHTML=devs.map(d=>{
+    const today=d.today||{};
+    const chips=(d.accounts&&d.accounts.length?d.accounts:['全池']).map(x=>
+      `<span class="chip ${d.accounts&&d.accounts.length?'acc':''}">${esc(x)}${d.primary===x?' ★':''}</span>`).join('');
+    const miss=(d.assigned_missing||[]).length;
+    return `<div class="card ${d.healthy_assigned===0&&d.accounts&&d.accounts.length?'down':'healthy'}">
+      <div class="card-top">
+        <div class="avatar" style="background:${avColor(d.name)}">🖥</div>
+        <div class="pname"><span>${esc(d.name)}</span>
+          <span class="tag st ${d.primary?'r ok':''}">${d.primary?'★ '+esc(d.primary):'主用号未定'}</span></div></div>
+      <div class="meta">分配 <b>${d.accounts&&d.accounts.length?d.accounts.length+' 个':'全池'}</b>
+        · 健康 <b>${d.healthy_assigned}</b> · 今日 <b>${fmtTok(today.in)}</b> in / <b>${fmtTok(today.out)}</b> out · <b>${today.req||0}</b> 请求</div>
+      <div class="chips">${chips}${miss?`<span class="chip" style="color:var(--bad)">缺失:${d.assigned_missing.join(',')}</span>`:''}</div>
+      <div class="ops"><button onclick="assign('${esc(d.name)}')">改分配</button>
+        <button onclick="showKey('${esc(d.name)}')">设备 key</button></div></div>`}).join('')}
+
+function showKey(name){toast('设备 key 在 pool.json 的 devices[].key（不回显）',true)}
+async function assign(name){
+  const st=JSON.parse((await api('/status',{headers:{'Authorization':'Bearer '+(localStorage.getItem('zpool-key')||'')}})).body);
+  const names=st.accounts.map(a=>a.name);
+  const cur=(st.devices.find(d=>d.name===name).accounts||[]).join(', ');
+  const inp=prompt(`设备 ${name} 分配账号（逗号分隔，留空=全池）\\n可用: ${names.join(', ')}`, cur);
+  if(inp===null)return;
+  const accounts=inp.split(',').map(s=>s.trim()).filter(Boolean);
+  const{status,body}=await api(`/admin/devices/${name}/assign`,{method:'POST',
+    headers:{'Authorization':'Bearer '+(localStorage.getItem('zpool-key')||''),'Content-Type':'application/json'},
+    body:JSON.stringify({accounts})});
+  toast(`assign ${name}: ${status===200?'ok':''+body.slice(0,80)}`,status===200);load()}
+
+async function load(){
+  $('btn-refresh').classList.add('busy');
+  try{
+    const key=localStorage.getItem('zpool-key')||'';
+    const{status,body}=await api('/status',{headers:{'Authorization':'Bearer '+key}});
+    if(status===401){const k=prompt('网关 api_key（存入 localStorage）：');if(k){localStorage.setItem('zpool-key',k);return load()}return}
+    render(JSON.parse(body));$('gen').textContent='GET /status @ '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  }catch(e){toast('加载失败：'+e.message,false)}
+  finally{$('btn-refresh').classList.remove('busy')}}
+async function admin(name,action){
+  const key=localStorage.getItem('zpool-key')||'';
+  const reason=action==='disable'?prompt('停用原因（可选）')||'':'';
+  try{
+    const{status,body}=await api(`/admin/accounts/${name}/${action}`,{method:'POST',
+      headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},
+      body:JSON.stringify({reason})});
+    toast(`${action} ${name}: ${status===200?'ok':body.slice(0,80)}`,status===200);
+    load()}catch(e){toast('失败：'+e.message,false)}}
+async function actAdmin(kind){
+  if(kind==='billing'){toast('巡检已由后台线程周期执行；手动触发请用命令行 --billing',true)}}
+load();setInterval(load,30000)
+</script></body></html>
