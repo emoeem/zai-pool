@@ -21,8 +21,8 @@ def load_module(name: str, path: Path):
 
 @pytest.fixture()
 def zp(monkeypatch):
-    """zai-pool 模块 + 测试池（占位 key，不触网）。"""
-    mod = load_module("zai_pool", ROOT / "zai-pool.py")
+    """zai-pool 模块 + 测试池（占位 key，不触网）。模块名避开 zai_pool 包命名空间。"""
+    mod = load_module("zp_entry", ROOT / "zai-pool.py")
     cfg = {
         "api_key": "test-key-0123456789abcdef",
         "reset_hour": 9,

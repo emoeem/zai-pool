@@ -3,6 +3,14 @@
 审查来源：GitHub main 分支静态审查（df2d7c8）。本文件记录每个问题的处置状态；
 修复以 tests/ 回归 + CI 通过为进入下一阶段的门槛。
 
+## Phase 6 模块化（2026-11-22 首次尝试：回滚，推迟）
+
+- 尝试：AST 按顶层节点抽取 core 域（Account/Device/Pool/锁/桶/解析器/validate_security/UPSTREAMS）到 `zai_pool/core.py`
+- 结果：三轮补残留名称（MAX_BODY_BYTES/UPSTREAMS/模块名冲突 conftest 已修）后仍有 15 failed/27 errors——单文件内隐式耦合比预估深
+- 处置：**按 §6.2 纪律整体回滚**（行为零变化不可让步；观察期网关零影响），71 tests + 13 验收恢复绿
+- 保留成果：`tests/conftest.py` 模块注册名改为 `zp_entry`（消除与未来 `zai_pool` 包的命名冲突，下次迁移的前置修复）
+- 下次迁移前置条件：先把 zai-pool.py 内部按域加显式边界注释 + 为隐式共享名（MAX_BODY_BYTES/UPSTREAMS/BILLING_*）建立单一所有权，再机械搬运
+
 ## Phase 4：性能、连接与资源管理（2026-11-22）
 
 | 计划项 | 处置 |
