@@ -1,14 +1,25 @@
 """BillingAdapter：巡检 + 领取状态机（pending→previewed→claiming→
-success/already/failed→verified），auto_claim 由网关配置门控。"""
+success/already/failed→verified），auto_claim 由网关配置门控。
+
+时区口径（计划书 5.3）：promo plan_id 中的 MMDD 与账本"当日"均按 CST
+（上游增长体系同口径）；CI/部署机的本地时区不影响判定。
+"""
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 
 from billing.client import BillingClient
 from billing.models import ClaimOutcome
 from billing.parser import (BillingParseError, parse_balance, parse_claim_response,
                             parse_plans)
 from billing.tracker import BillingLedger
+
+CST = timezone(timedelta(hours=8))
+
+
+def cst_today_md() -> str:
+    return datetime.now(CST).strftime("%m%d")
 
 
 class BillingAdapter:
@@ -54,7 +65,7 @@ class BillingAdapter:
             plans = parse_plans(st)
         except BillingParseError as e:
             return self._fail(name, "", f"preview 结构不可识别: {e}", trigger, st)
-        today_md = time.strftime("%m%d")
+        today_md = cst_today_md()
         target = None
         for p in plans:
             pid = str(p.get("plan_id") or "")
