@@ -137,6 +137,18 @@ def run_bench(port: int, concurrency: int, requests: int, mode: str) -> dict:
             "p50": pct(50), "p95": pct(95), "p99": pct(99)}
 
 
+def poll_slot_leak(mod, timeout: float = 6.0) -> int:
+    """槽位释放是 finally 异步完成的；客户端 join 后轮询等待，仍非零才判泄漏。"""
+    deadline = time.time() + timeout
+    leaked = -1
+    while time.time() < deadline:
+        leaked = sum(1 for x in mod.POOL.accounts if x.in_flight != 0)
+        if leaked == 0:
+            break
+        time.sleep(0.05)
+    return leaked
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--concurrency", type=int, default=10)
@@ -153,8 +165,7 @@ def main() -> int:
             port = srv.server_address[1]
             r = run_bench(port, c, min(a.requests, 200), a.mode)
             r["in_flight_peak"] = max((x.in_flight for x in mod.POOL.accounts), default=0)
-            leaked = sum(1 for x in mod.POOL.accounts if x.in_flight != 0)
-            r["slot_leak_after"] = leaked
+            r["slot_leak_after"] = poll_slot_leak(mod)
             results.append(r)
             srv.shutdown()
             print(json.dumps(r, ensure_ascii=False))
@@ -162,7 +173,7 @@ def main() -> int:
         mod, srv = boot(a.mode, a.upstream_delay)
         port = srv.server_address[1]
         r = run_bench(port, a.concurrency, a.requests, a.mode)
-        r["slot_leak_after"] = sum(1 for x in mod.POOL.accounts if x.in_flight != 0)
+        r["slot_leak_after"] = poll_slot_leak(mod)
         results.append(r)
         srv.shutdown()
         print(json.dumps(r, ensure_ascii=False))
