@@ -19,11 +19,13 @@ import secrets
 import subprocess
 import sys
 import threading
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-WEB_TOKEN = secrets.token_urlsafe(16)  # 每次启动随机；exec 类危险操作需此令牌
+WEB_TOKEN = secrets.token_urlsafe(16)   # 每次启动随机；exec 类危险操作需此令牌
+CSRF_TOKEN = secrets.token_urlsafe(16)  # 经 /api/list 下发；写操作必须回带
 
 ZACC = str(Path(__file__).resolve().parent / "zacc.py")
 
@@ -145,7 +147,8 @@ function toast(tx,ok=true){$('toast-tx').textContent=tx;$('toast-ic').textConten
   $('toast').className='show '+(ok?'ok':'err');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').className='',2600)}
 function log(s){$('out').textContent+= (s+'\n');$('out').scrollTop=1e9}
 async function api(path,body,extraHeaders){
-  const o=body?{method:'POST',headers:{'Content-Type':'application/json',...(extraHeaders||{})},body:JSON.stringify(body)}:{};
+  const h={'Content-Type':'application/json','X-CSRF':(window.DATA&&DATA.csrf)||'',...(extraHeaders||{})};
+  const o=body?{method:'POST',headers:h,body:JSON.stringify(body)}:{};
   const r=await fetch(path,o);const j=await r.json().catch(()=>({error:'响应解析失败'}));
   if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));return j}
 
@@ -287,21 +290,41 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "accounts": accounts,
                 "current": cur_out if cur_code == 0 else None,
+                "csrf": CSRF_TOKEN,
             })
         return self._json(404, {"error": "not found"})
 
     def _same_origin(self) -> bool:
-        """CSRF 防护：POST 必须来自本地面板（Origin/Host 均为 127.0.0.1|localhost）。"""
-        origin = (self.headers.get("Origin") or "").lower()
-        host = (self.headers.get("Host") or "").lower()
-        for v in (origin, host):
-            if v and "127.0.0.1" not in v and "localhost" not in v:
-                return False
-        return True
+        """严格同源：urlsplit 精确比对 scheme+hostname+port，拒绝缺失/畸形 Origin。
+        （子串判断会被 127.0.0.1.attacker.example 这类域名绕过——已废弃）"""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return False
+        try:
+            o = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        if o.scheme != "http" or not o.hostname:
+            return False
+        port = self.server.server_address[1]
+        if o.hostname not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        oport = o.port or 80
+        if oport != port:
+            return False
+        # Host 头也必须是本机:端口（防 DNS rebinding / 代理转发）
+        host_hdr = (self.headers.get("Host") or "").lower()
+        return host_hdr in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}")
+
+    def _csrf_ok(self) -> bool:
+        return self.headers.get("X-CSRF") == CSRF_TOKEN
 
     def do_POST(self):
         if not self._same_origin():
-            return self._json(403, {"error": "cross-origin POST 已拒绝（CSRF 防护）"})
+            return self._json(403, {"error": "cross-origin POST 已拒绝（严格同源校验）"})
+        if self.path in ("/api/use", "/api/add", "/api/save", "/api/rm", "/api/exec"):
+            if not self._csrf_ok():
+                return self._json(403, {"error": "缺少有效 X-CSRF（从 /api/list 获取）"})
         if self.path == "/api/exec":
             if os.environ.get("ZACC_WEB_ALLOW_EXEC") != "1":
                 return self._json(403, {"error": "exec 功能默认关闭：如需开放，启动前 export ZACC_WEB_ALLOW_EXEC=1，并在面板输入启动令牌"})

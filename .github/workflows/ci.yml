@@ -29,3 +29,6 @@ jobs:
           python -m pytest tests/ -q
         env:
           ZPOOL_TEST: "1"
+      - name: 生产验收套件（10 场景 + 重启恢复，mock 上游）
+        run: |
+          python tests/acceptance.py

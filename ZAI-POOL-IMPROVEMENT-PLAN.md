@@ -3,6 +3,18 @@
 审查来源：GitHub main 分支静态审查（df2d7c8）。本文件记录每个问题的处置状态；
 修复以 tests/ 回归 + CI 通过为进入下一阶段的门槛。
 
+## 第二阶段：生产环境验收与稳定性收口（2026-11-22）
+
+| 项 | 处置 |
+|---|---|
+| zacc-web Origin 校验为子串判断（127.0.0.1.attacker.example 可绕过、缺失 Origin 放行） | ✅ urlsplit 精确比对 scheme+hostname+port，拒绝缺失/畸形/端口不符；Host 头同检（防 DNS rebinding） |
+| 写操作无独立 CSRF Token | ✅ CSRF_TOKEN（启动随机，经 /api/list 下发），use/add/save/rm/exec 必须回带 X-CSRF；`tests/test_zacc_web.py` 6 用例（含子串绕过回归） |
+| test_error_classification 未真驱动 _relay | ✅ 升级为真 HTTP：mock 上游按请求体分流 400/401，断言 400 原样透传+零冷却、401 冷却换号至 503 |
+| 验收场景表（10 项） | ✅ `tests/acceptance.py` 13 断言全过：账号可达、设备隔离正向+**反向（B1 耗尽→503 不偷用 A1/A2）**、跨设备粘性隔离、额度切换、全池 503、**SSE 断开（in_flight 释放/记账/可再调度）**、热重载生效、Anthropic 头透传、OpenAI models+记账、重启恢复（SIGTERM 落盘） |
+| SSE 客户端断开上游连接泄漏 | ✅ 流式 finally 显式 resp.close() |
+| Billing 真实验证（先查后领） | ✅ 3 账号真 JWT：balance 解析（daily 3M 全新 / WEEKEND 500M 已用 374M，remaining_ratio=0.263 喂权重）、claim=already（当日已领）；巡检失败不影响转发路径 |
+| CI | ✅ 新增 acceptance 步骤（与 pytest 同矩阵） |
+
 ## P0 安全（已全部修复，tests/test_zacc_security.py + 启动安全闸）
 
 | # | 问题 | 处置 |

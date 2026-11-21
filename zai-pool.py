@@ -1191,7 +1191,12 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                 except (BrokenPipeError, OSError):
-                    pass
+                    pass  # 客户端断开：槽位由外层 finally 释放
+                finally:
+                    try:
+                        resp.close()  # 显式关闭上游连接，不占上游/本地资源
+                    except Exception:
+                        pass
                 a.record(tin, tout)
                 if dev:
                     dev.record(tin, tout)

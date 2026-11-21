@@ -69,26 +69,75 @@ def test_in_flight_atomic_lease(zp):
     assert a.in_flight <= 2, f"并发租约超卖: {a.in_flight}"
 
 
-def test_error_classification_pass_through(zp, fake_upstream):
-    """400 客户端错误：透传给客户端、不冷却账号、不换号。"""
-    mod, calls, script = fake_upstream
-    script.append((400, b'{"error":"bad model"}', {}))
-    handler_calls = []
+def test_error_classification_pass_through(zp, tmp_path):
+    """审查升级：真 HTTP 驱动 _relay——400 原样透传且账号不冷却；401 冷却。"""
+    import urllib.request
+    import urllib.error
+    import threading
+    mod = zp
 
-    class FakeHandler:
-        headers = {"anthropic-version": "2023-06-01"}
-        def _json(self, code, obj):
-            handler_calls.append((code, obj))
-    h = FakeHandler()
-    # 直接驱动 _relay 的错误分类段：用小池模拟
-    pool = mod.POOL
-    a = pool.accounts[0]
-    status, rh, resp = mod.upstream_request(a, "/x", b"{}", {"Authorization": "Bearer P1"})
-    assert status == 400
-    assert status in mod.PASS_THROUGH_STATUS
-    # 分类断言：400 不进 cooldown
-    pool.cooldown(a, 429, "limited", {})  # 对照：429 会冷却
-    assert a.cool_until > 0
+    class FakeResp:
+        def __init__(self, status, body):
+            self.status = status
+            self._b = body
+
+        def read(self, n=-1):
+            out, self._b = self._b, b""
+            return out
+
+        def getheaders(self):
+            return [("content-type", "application/json")]
+
+    cfg = {"listen": "127.0.0.1:0", "api_key": "test-key-0123456789abcdef",
+           "max_retry": 3,
+           "accounts": [{"name": "a1", "api_key": "P1"}, {"name": "a2", "api_key": "P2"}]}
+    mod.POOL = mod.Pool(cfg)
+    mod.STATE_FILE = ""
+    a1, a2 = mod.POOL.accounts
+
+    def fake_upstream(a, path, body=b"", extra=None, method="POST", host=None, timeout=600):
+        # 与选号顺序解耦：body 里的模型名决定上游行为（真实上游语义：坏模型=400，与账号无关）
+        try:
+            model = json.loads(body).get("model")
+        except Exception:
+            model = ""
+        if model == "bad-model":
+            return 400, {"content-type": "application/json"}, FakeResp(400, b'{"error":{"message":"invalid model"}}')
+        return 401, {"content-type": "application/json"}, FakeResp(401, b'{"error":"auth"}')
+
+    mod.upstream_request = fake_upstream
+    srv = mod.ThreadingHTTPServer(("127.0.0.1", 0), mod.Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        hdr = {"Authorization": "Bearer test-key-0123456789abcdef",
+               "Content-Type": "application/json"}
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps({"model": "bad-model",
+                             "messages": [{"role": "user", "content": "x"}]}).encode(),
+            headers=hdr)
+        code = None
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            code = e.code
+            assert b"invalid model" in e.read()
+        assert code == 400, "400 必须原样透传状态码"
+        assert all(x.cool_until == 0 for x in (a1, a2)), "400 不得冷却任何账号"
+        # 401：所有号都 401 → 冷却 → 换号 → 无号可用 → 503
+        req2 = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps({"model": "glm-5.3-flash",
+                             "messages": [{"role": "user", "content": "x"}]}).encode(),
+            headers=hdr)
+        try:
+            urllib.request.urlopen(req2)
+        except urllib.error.HTTPError as e:
+            assert e.code == 503
+        assert a1.cool_until > 0 and a2.cool_until > 0, "401 必须冷却"
+    finally:
+        srv.shutdown()
 
 
 def test_alerter_pending_to_firing(zp):
