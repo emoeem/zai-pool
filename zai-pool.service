@@ -15,6 +15,12 @@ RestartSec=3
 TimeoutStopSec=10
 # 不设全局 WriteTimeout 保护 SSE；内存上限防泄漏
 MemoryMax=512M
+# 7.4 systemd 加固（与 /opt 部署兼容；若配置/状态放 $HOME 需去掉 ProtectHome）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 StandardOutput=append:/opt/zai-pool/server.log
 StandardError=append:/opt/zai-pool/server.log
 

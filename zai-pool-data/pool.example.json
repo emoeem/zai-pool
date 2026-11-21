@@ -1,6 +1,7 @@
 {
+ "schema_version": 2,
  "listen": "127.0.0.1:8602",
- "api_key": "必填：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\" 生成（<16 字符拒绝启动）",
+ "api_key": "必填：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\" 生成（<16 字符拒绝启动）；轮换期可用 \"api_keys\": [新, 旧] 平滑过渡",
  "reset_hour": 9,
  "strategy": "sticky-first",
  "max_retry": 4,
@@ -19,7 +20,8 @@
  "billing": {
   "enabled": true,
   "interval_minutes": 10,
-  "claim_hour": 9
+  "claim_hour": 9,
+  "auto_claim": false
  },
  "accounts": [
   {

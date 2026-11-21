@@ -77,6 +77,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CST = timezone(timedelta(hours=8))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from billing import BillingAdapter            # noqa: E402  Phase5 独立化
+from billing.policy import exhausted as _bal_exhausted, token_ratio as _bal_ratio
+from billing.tracker import BillingLedger     # noqa: E402
 UPSTREAMS = {
     # realm -> (host, openai 前缀, anthropic 前缀)；cn = bigmodel.cn 国内通道
     "global": {"host": "api.z.ai", "openai": "/api/coding/paas/v4", "anthropic": "/api/anthropic"},
@@ -430,17 +434,22 @@ class Account:
             t["req"] += 1
 
     def remaining_ratio(self) -> float | None:
-        """billing 巡检的剩余比例；无 billing 数据返回 None（权重取中性 0.5）。"""
-        b = self.billing.get("balances")
-        if not b:
-            return None
-        tot = sum(x.get("total_units", 0) for x in b)
-        rem = sum(x.get("remaining_units", 0) for x in b)
-        return rem / tot if tot > 0 else 0.0
+        """billing 巡检的剩余比例（仅 token 单位条目）；无 billing 数据返回 None。"""
+        from billing.models import Balance
+        b = [Balance(self.name, x.get("plan_id", ""), x.get("plan_name", ""),
+                     x.get("show_name", ""), x.get("unit_type", "token"),
+                     x.get("total_units", 0), x.get("used_units", 0),
+                     x.get("remaining_units", 0)) for x in self.billing.get("balances") or []]
+        return _bal_ratio(b)
 
     def exhausted(self) -> bool:
-        r = self.remaining_ratio()
-        return r is not None and r <= 0.0
+        """整个账号耗尽 = 有条目且全部 remaining<=0（不同套餐独立判断，不混合单位）。"""
+        from billing.models import Balance
+        b = [Balance(self.name, x.get("plan_id", ""), "", x.get("show_name", ""),
+                     x.get("unit_type", "token"), x.get("total_units", 0),
+                     x.get("used_units", 0), x.get("remaining_units", 0))
+             for x in self.billing.get("balances") or []]
+        return _bal_exhausted(b)
 
 
 class Pool:
@@ -449,6 +458,9 @@ class Pool:
         self.accounts = [Account(a) for a in cfg["accounts"] if a.get("api_key")]
         self.devices = [Device(d) for d in (cfg.get("devices") or []) if d.get("key")]
         self.api_key = cfg.get("api_key", "")
+        # 密钥轮换（7.3）：api_key 可为字符串或数组；新 key 生效前旧 key 不失效
+        keys = cfg.get("api_keys") or [cfg.get("api_key") or ""]
+        self.api_keys = {str(k).strip() for k in keys if str(k).strip()}
         self.reset_hour = int(cfg.get("reset_hour", 9))
         self.strategy = cfg.get("strategy", "sticky-first")
         self.max_retry = int(cfg.get("max_retry", max(2, len(self.accounts))))
@@ -464,6 +476,7 @@ class Pool:
         self.server_cfg.update(cfg.get("server") or {})
         self._global_bucket = TokenBucket(float(self.server_cfg.get("rate_limit_per_min", 0)))
         self._device_buckets: dict[str, TokenBucket] = {}
+        self.admin_bucket = TokenBucket(30)  # 7.3 管理操作限流（30/分钟）
         if not self.accounts:
             raise SystemExit("pool.json 没有有效账号")
 
@@ -488,7 +501,7 @@ class Pool:
 
     def device_by_key(self, key: str) -> Device | None:
         for d in self.devices:
-            if d.key and d.key == key:
+            if key in d.keys:
                 return d
         return None
 
@@ -682,11 +695,12 @@ Account.expires_ts = _expires_ts  # noqa: 统一挂载
 
 
 class Device:
-    """接入设备：独立 key + 账号分配子集（空 = 全池）+ 每设备记账。"""
+    """接入设备：独立 key（可数组，平滑轮换）+ 账号分配子集（空 = 全池）+ 每设备记账。"""
 
     def __init__(self, cfg: dict):
         self.name = cfg["name"]
-        self.key = (cfg.get("key") or "").strip()
+        keys = cfg.get("keys") or [cfg.get("key") or ""]
+        self.keys = {str(k).strip() for k in keys if str(k).strip()}
         self.accounts = list(cfg.get("accounts") or [])
         self.primary: str | None = None
         self.usage: dict[str, dict] = {}
@@ -819,37 +833,26 @@ def load_state() -> None:
             d.primary = dev_by[d.name].get("primary")
 
 
-# ---------- billing 自动化 ----------
-def billing_headers(a: Account) -> dict:
-    h = {"Authorization": f"Bearer {a.zcode_jwt}", "User-Agent": UA}
-    if a.device_mid:
-        h["x-device-mid"] = a.device_mid
-    return h
+# ---------- billing 自动化（Phase5：走 billing/ 独立子系统） ----------
+_billing_adapter: BillingAdapter | None = None
 
 
-def billing_call(a: Account, path: str, body: dict | None = None) -> tuple[int, dict | str]:
-    b = json.dumps(body).encode() if body else None
-    status, _, resp = upstream_request(
-        a, BILLING_BASE + path + ("?app_version=" + BILLING_APP_VERSION if path.startswith("/billing/balance") else ""),
-        body=b, extra=billing_headers(a), method="POST" if body else "GET", host=BILLING_HOST, timeout=45)
-    raw = resp.read().decode(errors="replace")
-    try:
-        return status, json.loads(raw)
-    except Exception:
-        return status, raw[:200]
+def get_billing_adapter() -> BillingAdapter:
+    global _billing_adapter
+    if _billing_adapter is None:
+        bcfg = POOL.cfg.get("billing") or {}
+        _billing_adapter = BillingAdapter(
+            transport=upstream_request,
+            ledger=BillingLedger(Path(CFG_PATH).with_name("billing-ledger.jsonl")),
+            claim_hour=int(bcfg.get("claim_hour", POOL.reset_hour)),
+            auto_claim=bool(bcfg.get("auto_claim", False)))  # 默认关闭（计划书 5.4）
+    return _billing_adapter
 
 
 def fetch_billing(a: Account) -> bool:
-    """拉 balance+current 喂权重；返回账号是否已 active。"""
+    """巡检（只读）：失败隔离，不影响 API 转发；额度结果喂权重与自动恢复。"""
     try:
-        st, bal = billing_call(a, "/billing/balance")
-        if st == 200 and isinstance(bal, dict) and bal.get("code") == 0:
-            a.billing["balances"] = (bal.get("data") or {}).get("balances") or []
-        st2, cur = billing_call(a, "/billing/current")
-        if st2 == 200 and isinstance(cur, dict) and cur.get("code") == 0:
-            plans = ((cur.get("data") or {}).get("plans")) or []
-            a.billing["plans"] = [{"plan_id": p.get("plan_id"), "name": p.get("name"),
-                                   "ends_at": p.get("ends_at"), "status": p.get("status")} for p in plans]
+        a.billing = get_billing_adapter().inspect(a)
     except Exception as e:
         log(f"[billing] {a.name} 巡检失败 {type(e).__name__}: {e}")
         return False
@@ -866,26 +869,11 @@ def fetch_billing(a: Account) -> bool:
 
 
 def claim_plan(a: Account) -> str:
-    """领取当日 plan：preview 找未领取的 promo → claim。返回 ok/already/fail。"""
+    """领取状态机入口；返回 ok/already/fail 摘要（账本由 adapter 落盘）。"""
     try:
-        st, prev = billing_call(a, "/billing/preview")
-        if st != 200 or not isinstance(prev, dict) or prev.get("code") not in (0, None):
-            return f"fail(preview {st})"
-        plans = (prev.get("data") or {}).get("plans") or prev.get("data") or []
-        today = now_cst().strftime("%m%d")
-        target = None
-        if isinstance(plans, list):
-            for p in plans:
-                pid = str(p.get("plan_id") or "")
-                if "start-plan" in pid and today in pid:
-                    target = pid
-                    break
-        if not target:
-            return "already"
-        st2, cl = billing_call(a, "/billing/claim", {"plan_id": target})
-        if st2 == 200:
-            return f"ok({target})"
-        return f"fail(claim {st2} {str(cl)[:80]})"
+        oc = get_billing_adapter().claim_flow(a, trigger="manual")
+        tag = {"success": "ok", "already": "already", "unverified": "ok(unverified)"}.get(oc.status, "fail")
+        return f"{tag}({oc.plan_id} {oc.detail})" if oc.plan_id else f"{tag}({oc.detail})"
     except Exception as e:
         return f"fail({type(e).__name__}: {e})"
 
@@ -925,9 +913,11 @@ def billing_worker(stop: threading.Event) -> None:
             save_state()
             next_scan = now + interval
         # 每日 claim（09:00 后触发一次；jitter = salt+kind+day 散列）
+        # auto_claim 默认关闭（计划书 5.4）：关闭时 worker 完全不触领取路径
+        auto = bool((POOL.cfg.get("billing") or {}).get("auto_claim", False))
         day = now_cst().strftime("%Y-%m-%d")
         dt = now_cst()
-        if dt.hour >= claim_hour and last_claim_day != day:
+        if auto and dt.hour >= claim_hour and last_claim_day != day:
             jitter = int(hashlib.sha256(f"claim|{day}".encode()).hexdigest()[:8], 16) % 900
             if (dt.hour * 3600 + dt.minute * 60 + dt.second) >= jitter:
                 results = {}
@@ -1069,6 +1059,8 @@ def reload_config() -> None:
         POOL.devices = merged_dev
         # 池级字段整体同步
         POOL.api_key = cfg.get("api_key", POOL.api_key)
+        keys = cfg.get("api_keys") or [cfg.get("api_key") or ""]
+        POOL.api_keys = {str(k).strip() for k in keys if str(k).strip()}
         POOL.cfg = cfg
         POOL.strategy = cfg.get("strategy", POOL.strategy)
         POOL.max_retry = int(cfg.get("max_retry", POOL.max_retry))
@@ -1169,10 +1161,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _authed(self) -> bool:
-        if not POOL.api_key:
+        if not POOL.api_keys:
             return True
         h = self.headers.get("Authorization") or self.headers.get("x-api-key") or ""
-        return h.replace("Bearer ", "").strip() == POOL.api_key
+        return h.replace("Bearer ", "").strip() in POOL.api_keys
 
     def _json(self, code: int, obj: dict):
         raw = json.dumps(obj, ensure_ascii=False).encode()
@@ -1429,9 +1421,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/v1/messages", "/api/anthropic/v1/messages"):
             return self._relay(UP_ANTHROPIC_PATH + "/v1/messages", "anthropic")
         m = urllib.parse.urlparse(self.path).path
-        if m.startswith("/admin/accounts/") and POOL.admin_cfg.get("enabled"):
+        if m.startswith("/admin/") and POOL.admin_cfg.get("enabled"):
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
+            if not POOL.admin_bucket.allow():
+                return self._json(429, {"error": {"message": "admin rate limit exceeded",
+                                                  "type": "admin_rate_limited"}})
             parts = m.strip("/").split("/")
             name, action = parts[2], parts[3] if len(parts) > 3 else ""
             a = next((x for x in POOL.accounts if x.name == name), None)
@@ -1615,8 +1610,24 @@ DANGEROUS_KEYS = {"", "zpool-local-change-me", "change_me", "change-me", "test_k
 
 
 def validate_security(cfg: dict, cfg_path: str) -> None:
-    """启动安全闸：密钥强度 / 监听面 / 配置文件权限。不达标拒绝启动。"""
-    key = (cfg.get("api_key") or "").strip()
+    """启动安全闸：密钥强度 / 监听面 / 配置文件权限。不达标拒绝启动。
+    api_key 支持数组（轮换期多 key 并存），每个 key 都必须达标。"""
+    keys = [str(k).strip() for k in (cfg.get("api_keys") or [cfg.get("api_key") or ""])
+            if str(k).strip()]
+    if not keys:
+        raise SystemExit(
+            f"[security] api_key 为空——拒绝启动。\n"
+            f"  生成强密钥：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\"\n"
+            f"  写入 {cfg_path} 的 api_key 字段后重启。")
+    for k in keys:
+        if k.lower() in DANGEROUS_KEYS:
+            raise SystemExit(
+                f"[security] api_keys 含模板默认值——拒绝启动。\n"
+                f"  生成强密钥：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\"")
+        if len(k) < 16:
+            raise SystemExit("[security] api_keys 存在 <16 字符的密钥，拒绝启动；"
+                             "生成强密钥：python3 -c \"import secrets; print('zpool-'+secrets.token_urlsafe(24))\"")
+    key = keys[0]
     listen = cfg.get("listen", "127.0.0.1:8602")
     loopback = listen.rsplit(":", 1)[0] in ("127.0.0.1", "localhost", "::1", "")
     if key.lower() in DANGEROUS_KEYS:
@@ -1656,6 +1667,12 @@ def main() -> int:
     a = ap.parse_args()
     CFG_PATH = a.config
     cfg = json.loads(Path(CFG_PATH).read_text())
+    # Phase8-8.2 配置版本：不兼容 schema 明确拒绝，不做静默迁移
+    sv = int(cfg.get("schema_version", 1))
+    if sv not in (1, 2):
+        raise SystemExit(f"[config] schema_version={sv} 不受支持（支持 1/2）；"
+                         f"请参考 pool.example.json 与 CHANGELOG.md 迁移")
+    cfg["schema_version"] = sv
     # 安全闸：probe/honk-rules 等只读子命令也需要有效 key（请求会带它出站），但
     # --probe 允许占位 key（自检就是来发现坏 key 的）→ 仅服务启动路径强制
     POOL = Pool(cfg)
