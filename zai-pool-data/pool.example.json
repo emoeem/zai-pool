@@ -20,8 +20,10 @@
  "billing": {
   "enabled": true,
   "interval_minutes": 10,
-  "claim_hour": 9,
-  "auto_claim": false
+  "auto_claim": true,
+  "claim_days": "1-5",
+  "claim_hour": 19,
+  "claim_minute": 10
  },
  "accounts": [
   {

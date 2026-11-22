@@ -140,7 +140,10 @@ def log(msg: str) -> None:
 class Account:
     def __init__(self, cfg: dict):
         self.name = cfg["name"]
-        self.key = cfg["api_key"]
+        self.key = (cfg.get("api_key") or "").strip()
+        # chat_capable=False = billing-only 账号（免费套餐无 API Key）：
+        # 不参与对话调度，仅 billing 巡检/领取（Phase5 适配免费套餐）
+        self.chat_capable = bool(self.key)
         self.realm = cfg.get("realm", "global")
         if self.realm not in UPSTREAMS:
             self.realm = "global"
@@ -232,7 +235,9 @@ class Account:
 class Pool:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.accounts = [Account(a) for a in cfg["accounts"] if a.get("api_key")]
+        # 入池条件：有 api_key（对话调度）或仅有 zcode_jwt（billing-only：只巡检/领取）
+        self.accounts = [Account(a) for a in cfg["accounts"]
+                         if a.get("api_key") or a.get("zcode_jwt")]
         self.devices = [Device(d) for d in (cfg.get("devices") or []) if d.get("key")]
         self.api_key = cfg.get("api_key", "")
         # 密钥轮换（7.3）：api_key 可为字符串或数组；新 key 生效前旧 key 不失效
@@ -323,7 +328,7 @@ class Pool:
                     self.sched["sticky_unbind"] += 1
         alive = [a for a in self.accounts
                  if a.available() and a.name not in exclude and not a.exhausted()
-                 and in_scope(a)]
+                 and a.chat_capable and in_scope(a)]
         if not alive:
             return None
         now = time.time()
@@ -338,7 +343,7 @@ class Pool:
             # 主用号复用（设备级或池级）；必须仍在分配子集内
             for a in self.accounts:
                 if (a.name == primary_name and a.available() and a.name not in exclude
-                        and not a.exhausted() and in_scope(a)):
+                        and not a.exhausted() and a.chat_capable and in_scope(a)):
                     a.last_picked = now
                     return a
             # 双段分配：新会话优先未被任何会话绑定的号

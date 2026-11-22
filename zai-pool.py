@@ -37,7 +37,8 @@
     admin:   {"enabled": false, "audit_file": "admin_audit.log"}
     alert:   {"enabled": false, "webhook_url": "", "secret": "", "min_healthy": 1,
               "interval_seconds": 30, "for_ticks": 2, "clear_ticks": 2}
-    billing: {"enabled": true, "interval_minutes": 10, "claim_hour": 9}
+    billing: {"enabled": true, "interval_minutes": 10, "auto_claim": false,
+             "claim_days": "1-5", "claim_hour": 19, "claim_minute": 10}  # 领取窗口=周一~五 19:10 CST
     accounts: [{
       "name": "acct1", "api_key": "sk-...", "expires": "2026-11-22 09:00",
       "proxy": "socks5://u:p@1.2.3.4:1080",        # 与 sport_range 二选一
@@ -202,6 +203,11 @@ def load_state() -> None:
 _billing_adapter: BillingAdapter | None = None
 
 
+def set_billing_adapter(ad: BillingAdapter) -> None:
+    global _billing_adapter
+    _billing_adapter = ad
+
+
 def get_billing_adapter() -> BillingAdapter:
     global _billing_adapter
     if _billing_adapter is None:
@@ -209,7 +215,7 @@ def get_billing_adapter() -> BillingAdapter:
         _billing_adapter = BillingAdapter(
             transport=upstream_request,
             ledger=BillingLedger(Path(CFG_PATH).with_name("billing-ledger.jsonl")),
-            claim_hour=int(bcfg.get("claim_hour", POOL.reset_hour)),
+            claim_hour=int(bcfg.get("claim_hour", 19)),
             auto_claim=bool(bcfg.get("auto_claim", False)))  # 默认关闭（计划书 5.4）
     return _billing_adapter
 
@@ -259,13 +265,46 @@ def ledger_record(kind: str, result: str, trigger: str) -> None:
     ent["all_failed"] = (ent["ok"] + ent["already"] == 0)
 
 
+def parse_claim_days(spec: str) -> set[int]:
+    """claim_days 解析："1-5"=周一~周五，"1,3,5"=离散，"0-6"=每天。
+    1=周一 … 7=周日（ISO 口径）。空/非法 → 全周。"""
+    days: set[int] = set()
+    try:
+        for part in str(spec or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                lo_i, hi_i = int(lo), int(hi)
+            elif part == "*":
+                days |= set(range(1, 8))
+                continue
+            else:
+                lo_i = hi_i = int(part)
+            if not (1 <= lo_i <= 7 and 1 <= hi_i <= 7):
+                continue
+            days |= set(range(min(lo_i, hi_i), max(lo_i, hi_i) + 1))
+    except ValueError:
+        return set(range(1, 8))
+    return days or set(range(1, 8))
+
+
+def _claim_window_due(dt, claim_days: set[int], claim_hour: int, claim_minute: int) -> bool:
+    """领取窗口判定（纯函数）：CST 星期在 claim_days 内且到达 claim_hour:claim_minute。"""
+    return (dt.isoweekday() in claim_days
+            and (dt.hour, dt.minute) >= (claim_hour, claim_minute))
+
+
 def billing_worker(stop: threading.Event) -> None:
-    """巡检 + claim 排程线程（确定性 jitter，CST 日界）。"""
+    """巡检 + claim 排程线程（CST；领取窗口可配：默认周一~周五 19:10 后）。"""
     bcfg = (POOL.cfg.get("billing") or {})
     if bcfg.get("enabled") is False:
         return
     interval = int(bcfg.get("interval_minutes", 10)) * 60
-    claim_hour = int(bcfg.get("claim_hour", POOL.reset_hour))
+    claim_days = parse_claim_days(bcfg.get("claim_days", "1-5"))
+    claim_hour = int(bcfg.get("claim_hour", 19))
+    claim_minute = int(bcfg.get("claim_minute", 10))
     last_claim_day = None
     next_scan = time.time() + 5
     while not stop.is_set():
@@ -277,24 +316,23 @@ def billing_worker(stop: threading.Event) -> None:
                     time.sleep(random.uniform(0.5, 2.0))  # 账号间随机 delay
             save_state()
             next_scan = now + interval
-        # 每日 claim（09:00 后触发一次；jitter = salt+kind+day 散列）
-        # auto_claim 默认关闭（计划书 5.4）：关闭时 worker 完全不触领取路径
+        # 领取窗口：claim_days 内的 claim_hour:claim_minute 后触发一次/日（CST）
+        # auto_claim 门控：关闭时 worker 完全不触领取路径；账本幂等防重复
         auto = bool((POOL.cfg.get("billing") or {}).get("auto_claim", False))
         day = now_cst().strftime("%Y-%m-%d")
         dt = now_cst()
-        if auto and dt.hour >= claim_hour and last_claim_day != day:
-            jitter = int(hashlib.sha256(f"claim|{day}".encode()).hexdigest()[:8], 16) % 900
-            if (dt.hour * 3600 + dt.minute * 60 + dt.second) >= jitter:
-                results = {}
-                for a in POOL.accounts:
-                    if a.zcode_jwt:
-                        r = claim_plan(a)
-                        results[a.name] = r
-                        ledger_record("claim", r, "schedule")
-                        time.sleep(random.uniform(1.0, 4.0))
-                last_claim_day = day
-                log(f"[claim] {results}")
-                save_state()
+        if (auto and last_claim_day != day
+                and _claim_window_due(dt, claim_days, claim_hour, claim_minute)):
+            results = {}
+            for a in POOL.accounts:
+                if a.zcode_jwt:
+                    r = claim_plan(a)
+                    results[a.name] = r
+                    ledger_record("claim", r, "schedule")
+                    time.sleep(random.uniform(1.0, 4.0))
+            last_claim_day = day
+            log(f"[claim] 窗口={claim_days} {claim_hour:02d}:{claim_minute:02d} → {results}")
+            save_state()
         stop.wait(5)
 
 
@@ -382,7 +420,8 @@ def config_fingerprint(path: str) -> str:
 def reload_config() -> None:
     try:
         cfg = json.loads(Path(CFG_PATH).read_text())
-        new_keys = {a["name"]: a for a in cfg["accounts"] if a.get("api_key")}
+        new_keys = {a["name"]: a for a in cfg["accounts"]
+                    if a.get("api_key") or a.get("zcode_jwt")}
         old = {a.name: a for a in POOL.accounts}
         merged = []
         for name, acfg in new_keys.items():

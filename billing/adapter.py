@@ -24,10 +24,13 @@ def cst_today_md() -> str:
 
 class BillingAdapter:
     def __init__(self, transport=None, ledger: BillingLedger | None = None,
-                 claim_hour: int = 9, auto_claim: bool = False):
+                 claim_hour: int = 19, claim_minute: int = 10,
+                 claim_days: str = "1-5", auto_claim: bool = False):
         self.client = BillingClient(transport)
         self.ledger = ledger or BillingLedger("/tmp/billing-ledger.jsonl")
         self.claim_hour = claim_hour
+        self.claim_minute = claim_minute
+        self.claim_days = claim_days
         self.auto_claim = auto_claim
 
     # ---------- 巡检（只读） ----------
