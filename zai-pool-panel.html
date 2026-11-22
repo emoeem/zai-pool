@@ -77,6 +77,7 @@ button.ghost{background:transparent}
   <div class="actions">
     <button id="btn-refresh" onclick="load()"><span class="spin"></span>刷新</button>
     <button class="ghost" onclick="actAdmin('billing')">▶ 巡检+领取</button>
+    <button class="ghost" onclick="showLedger()">领取台账</button>
   </div>
 </div>
 <div class="grid" id="grid"></div>
@@ -145,6 +146,8 @@ function render(st){
         · 健康 <b>${d.healthy_assigned}</b> · 今日 <b>${fmtTok(today.in)}</b> in / <b>${fmtTok(today.out)}</b> out · <b>${today.req||0}</b> 请求</div>
       <div class="chips">${chips}${miss?`<span class="chip" style="color:var(--bad)">缺失:${d.assigned_missing.join(',')}</span>`:''}</div>
       <div class="ops"><button onclick="assign('${esc(d.name)}')">改分配</button>
+        <button onclick="devadmin('${esc(d.name)}','disable')">停用</button>
+        <button onclick="devadmin('${esc(d.name)}','enable')">启用</button>
         <button onclick="showKey('${esc(d.name)}')">设备 key</button></div></div>`}).join('')}
 
 function showKey(name){toast('设备 key 在 pool.json 的 devices[].key（不回显）',true)}
@@ -178,6 +181,32 @@ async function admin(name,action){
       body:JSON.stringify({reason})});
     toast(`${action} ${name}: ${status===200?'ok':body.slice(0,80)}`,status===200);
     load()}catch(e){toast('失败：'+e.message,false)}}
+async function probe(name){
+  const key=localStorage.getItem('zpool-key')||'';
+  try{const{status,body}=await api(`/admin/accounts/${name}/probe`,{method:'POST',
+    headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},body:'{}'});
+    const j=JSON.parse(body);
+    toast(`探活 ${name}: ${j.healthy?'OK':'FAIL'} http=${j.http}`, j.healthy===true);
+    if(!j.healthy)log(`探活失败 ${name}: ${j.error||''}`);load()}catch(e){toast('探活失败：'+e.message,false)}}
+async function billcheck(name){
+  const key=localStorage.getItem('zpool-key')||'';
+  try{const{status,body}=await api(`/admin/accounts/${name}/billing-check`,{method:'POST',
+    headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},body:'{}'});
+    const j=JSON.parse(body);
+    toast(`巡检 ${name}: ${j.active?'额度可用':'耗尽/未配'}`, j.active===true);load()}
+  catch(e){toast('巡检失败：'+e.message,false)}}
+async function devadmin(name,action){
+  const key=localStorage.getItem('zpool-key')||'';
+  try{const{status,body}=await api(`/admin/devices/${name}/${action}`,{method:'POST',
+    headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},body:'{}'});
+    toast(`${action} ${name}: ${status===200?'ok':body.slice(0,60)}`,status===200);load()}
+  catch(e){toast('失败：'+e.message,false)}}
+async function showLedger(){
+  const key=localStorage.getItem('zpool-key')||'';
+  try{const{status,body}=await api('/billing/ledger',{headers:{'Authorization':'Bearer '+key}});
+    const j=JSON.parse(body);const rows=(j.entries||[]).slice(-10).reverse();
+    log('领取台账（最近10）:\n'+(rows.length?rows.map(r=>`${r.date} ${r.account} ${r.status} ${r.plan_id||''}`).join('\n'):'（空）'))}
+  catch(e){toast('台账读取失败：'+e.message,false)}}
 async function actAdmin(kind){
   if(kind==='billing'){toast('巡检已由后台线程周期执行；手动触发请用命令行 --billing',true)}}
 load();setInterval(load,30000)

@@ -479,6 +479,7 @@ class Device:
         keys = cfg.get("keys") or [cfg.get("key") or ""]
         self.keys = {str(k).strip() for k in keys if str(k).strip()}
         self.accounts = list(cfg.get("accounts") or [])
+        self.disabled = bool(cfg.get("disabled", False))  # 7.3 设备禁用（配置真源，admin 运行时可切）
         self.primary: str | None = None
         self.usage: dict[str, dict] = {}
 

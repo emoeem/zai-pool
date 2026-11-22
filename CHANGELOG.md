@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 新增（Phase 6 模块化 + Phase 7 管理安全）
+- `zai_pool/observability.py`：metrics 台账 + 告警三态机独立成域（POOL/LEDGER getter 注入）
+- 管理端点：单账号探活 `POST /admin/accounts/{n}/probe`（零额度）、只读巡检 `/billing-check`、领取台账 `GET /billing/ledger`
+- 设备禁用/启用：admin 端点 + 配置 `disabled` 真源 + 热重载同步，禁用设备请求 403 且零槽位消耗
+- 备份自动化：`scripts/backup.py --encrypt` 每日 04:30 排程（Fernet 加密，密钥 600）
+- 修复：Phase4 宽守卫 `/admin/` 截获 devices 路径的 404 回归
+
 ### 新增（Phase 6 渐进模块化）
 - `zai_pool/` 包：core（账号/设备/调度池/状态机）、storage（状态持久化/审计，init_storage 注入式句柄）、upstream（代理隧道/源端口分流/上游请求，POOL getter 注入）三域；CLI 入口 `python3 zai-pool.py` 行为不变，71 pytest + 13 验收 + 压测冒烟全绿
 

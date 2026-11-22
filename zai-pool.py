@@ -594,6 +594,18 @@ class Handler(BaseHTTPRequestHandler):
                                     "sticky_sessions": len(POOL.sticky),
                                     "sched": dict(POOL.sched),
                                     "devices": self._devices_view()})
+        if self.path == "/billing/ledger":
+            if not self._authed():
+                return self._json(401, {"error": "unauthorized"})
+            lp = Path(CFG_PATH).with_name("billing-ledger.jsonl")
+            rows = []
+            if lp.exists():
+                for ln in lp.read_text().splitlines()[-50:]:
+                    try:
+                        rows.append(json.loads(ln))
+                    except Exception:
+                        pass
+            return self._json(200, {"entries": rows})
         if self.path == "/metrics":
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
@@ -630,6 +642,9 @@ class Handler(BaseHTTPRequestHandler):
         dev = POOL.device_by_key(auth) if auth else None
         if not dev and not self._authed():
             return self._json(401, {"error": "unauthorized"})
+        if dev and dev.disabled:
+            return self._json(403, {"error": {"message": "device disabled",
+                                              "type": "device_disabled"}})
         # 4.4 本地限流：超限 429，不触碰上游账号状态机
         if not POOL.allow_request(dev):
             return self._json(429, {"error": {"message": "local rate limit exceeded",
@@ -784,15 +799,65 @@ class Handler(BaseHTTPRequestHandler):
                                                   "type": "admin_rate_limited"}})
             parts = m.strip("/").split("/")
             name, action = parts[2], parts[3] if len(parts) > 3 else ""
-            a = next((x for x in POOL.accounts if x.name == name), None)
-            if not a or action not in ("disable", "enable", "revive"):
-                return self._json(404, {"error": "not found"})
             n = int(self.headers.get("Content-Length") or 0)
             reason = ""
             try:
                 reason = (json.loads(self.rfile.read(n) or b"{}") or {}).get("reason", "")
             except Exception:
                 pass
+            # ---- devices 管理（先于 accounts 判定，防宽守卫截获） ----
+            if m.startswith("/admin/devices/"):
+                d = POOL.device_by_name(name)
+                if not d or action not in ("assign", "disable", "enable"):
+                    return self._json(404, {"error": "not found"})
+                if action in ("disable", "enable"):
+                    d.disabled = action == "disable"
+                    save_state()
+                    audit(action, name, "ok", key_fp(POOL.api_keys and sorted(POOL.api_keys)[0] or "-"))
+                    log(f"[admin] device {action} {name}")
+                    return self._json(200, {"name": d.name, "disabled": d.disabled})
+                new_accounts = json.loads(self.rfile.read(n) or b"{}").get("accounts")
+                if not isinstance(new_accounts, list):
+                    return self._json(400, {"error": "accounts 必须是数组（空数组=全池）"})
+                valid = {x.name for x in POOL.accounts}
+                missing = [x for x in new_accounts if x not in valid]
+                if missing:
+                    return self._json(400, {"error": f"未知账号: {missing}"})
+                old = d.accounts
+                d.accounts = [str(x) for x in new_accounts]
+                POOL.prune_sticky_for(d)
+                save_state()
+                audit("assign", name, "ok", key_fp(POOL.api_keys and sorted(POOL.api_keys)[0] or "-"),
+                      f"{old} -> {d.accounts}")
+                log(f"[admin] assign dev={name} accounts={d.accounts}")
+                return self._json(200, {"name": d.name, "accounts": d.accounts,
+                                        "primary": d.primary})
+            # ---- accounts 管理 ----
+            a = next((x for x in POOL.accounts if x.name == name), None)
+            if not a or action not in ("disable", "enable", "revive", "probe", "billing-check"):
+                return self._json(404, {"error": "not found"})
+            if action == "probe":
+                try:
+                    st_, _, resp_ = upstream_request(a, MODELS_PATH, method="GET", timeout=30)
+                    raw_ = resp_.read()
+                    ok_ = st_ == 200
+                    audit("probe", name, "ok" if ok_ else f"http={st_}",
+                          key_fp(sorted(POOL.api_keys)[0]))
+                    return self._json(200 if ok_ else 502,
+                                      {"name": name, "healthy": ok_, "http": st_,
+                                       "models": json.loads(raw_).get("data") if ok_ else None,
+                                       "error": None if ok_ else raw_[:200].decode(errors="replace")})
+                except Exception as e:
+                    audit("probe", name, f"fail {type(e).__name__}", key_fp(sorted(POOL.api_keys)[0]))
+                    return self._json(502, {"name": name, "healthy": False,
+                                            "error": f"{type(e).__name__}: {e}"})
+            if action == "billing-check":
+                if not a.zcode_jwt:
+                    return self._json(400, {"error": "该账号未配置 zcode_jwt"})
+                active = fetch_billing(a)
+                audit("billing-check", name, "ok" if active else "exhausted",
+                      key_fp(sorted(POOL.api_keys)[0]))
+                return self._json(200, {"name": name, "active": active, "billing": a.billing})
             if action == "disable":
                 a.manual_disabled = True
                 a.disabled_reason = reason
@@ -807,7 +872,7 @@ class Handler(BaseHTTPRequestHandler):
                 a.breaker_until = 0.0
                 a.degrade_until = 0.0
             save_state()
-            fp = key_fp(POOL.api_key or "-")
+            fp = key_fp(sorted(POOL.api_keys)[0])
             audit(action, name, "ok", fp, reason)
             log(f"[admin] {action} {name} reason={reason}")
             return self._json(200, {"name": a.name, "manual_disabled": a.manual_disabled,

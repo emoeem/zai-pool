@@ -26,6 +26,7 @@ def zp(monkeypatch):
     cfg = {
         "api_key": "test-key-0123456789abcdef",
         "reset_hour": 9,
+        "admin": {"enabled": True},
         "strategy": "sticky-first",
         "accounts": [
             {"name": "a1", "api_key": "P1", "realm": "global"},
