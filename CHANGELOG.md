@@ -2,6 +2,11 @@
 
 所有显著变更记录于此。格式参考 Keep a Changelog；版本遵循 SemVer。
 
+## [Unreleased]
+
+### 新增（Phase 6 渐进模块化）
+- `zai_pool/` 包：core（账号/设备/调度池/状态机）、storage（状态持久化/审计，init_storage 注入式句柄）、upstream（代理隧道/源端口分流/上游请求，POOL getter 注入）三域；CLI 入口 `python3 zai-pool.py` 行为不变，71 pytest + 13 验收 + 压测冒烟全绿
+
 ## [1.0.0] - 2026-11-22
 
 首个稳定版本。八阶段改进计划（源码审查 → P0/P1 修复 → 生产验收 → 资源管理 → Billing 独立化 → 安全/备份/发布）全部收口。

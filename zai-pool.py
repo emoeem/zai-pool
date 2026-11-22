@@ -82,6 +82,8 @@ from billing.policy import exhausted as _bal_exhausted, token_ratio as _bal_rati
 from billing.tracker import BillingLedger     # noqa: E402
 # ==== Phase6 core 域搬移（try2）：单一所有权在 zai_pool/core.py，re-import 保证下游引用不变 ====
 # UPSTREAMS 族与 MAX_BODY_BYTES 属 re-export：upstream/http 域引用保持可用
+from zai_pool.upstream import (UA, _bind_sport, _recv_exact, _ssl_ctx, open_tunnel,  # noqa: E402
+                           set_pool_getter, upstream_request, UpstreamConn)
 from zai_pool.core import (  # noqa: E402  core 域节点搬移，re-export 回流
     CST, DEFAULT_SERVER, DANGEROUS_KEYS, MAX_BODY_BYTES, SSEUsageParser, TokenBucket,
     UPSTREAMS, UP_ANTHROPIC_PATH, UP_HOST, UP_OPENAI_PATH,
@@ -140,151 +142,25 @@ class BoundedServer(ThreadingHTTPServer):
             with self._conn_lock:
                 self.active -= 1
 # upstream 域：上游请求 UA
-UA = "zai-pool/3.0"
 # core 域：UPSTREAMS 族派生——模型列表路径（http /v1/models 与 entry --probe 读用）
 MODELS_PATH = UP_OPENAI_PATH + "/models"
 # http 域：Web 面板静态文件路径
 PANEL_FILE = Path(__file__).resolve().parent / "zai-pool-panel.html"
 
 # ---- 模块级运行态（跨域共享锁/上下文；Phase6 拆包归属：_state_lock/_sched_lock→core、_persist_lock→storage（下方随 storage 域 re-export 回流）、_ssl_ctx→upstream、_seq→http） ----
-_ssl_ctx = ssl.create_default_context()
 _seq = [0]
 
 
 # ==== domain: upstream ====
 # ---------- 代理隧道 ----------
-def _recv_exact(s: socket.socket, n: int) -> bytes:
-    """TCP 不保证单次 recv 返回全部字节；循环读满 n 字节。"""
-    buf = b""
-    while len(buf) < n:
-        c = s.recv(n - len(buf))
-        if not c:
-            raise OSError("proxy closed mid-handshake")
-        buf += c
-    return buf
 
 
-def open_tunnel(proxy: str, host: str = UP_HOST, port: int = 443,
-                timeout: int = 20, bind_port: int | None = None) -> socket.socket:
-    u = urllib.parse.urlparse(proxy)
-    scheme = u.scheme.lower()
-    if scheme == "https":
-        # 未实现到代理本身的 TLS 握手，宁可拒绝也不静默降级
-        raise OSError("不支持 https:// 代理（未实现代理侧 TLS），请改用 http:// 或 socks5://")
-    phost, pport = u.hostname, u.port or (8080 if scheme == "http" else 1080)
-    s = socket.socket()
-    if bind_port:
-        s.bind(("0.0.0.0", bind_port))
-    s.settimeout(timeout)
-    s.connect((phost, pport))
-    creds = f"{u.username}:{u.password or ''}" if u.username else ""
-    if scheme == "http":
-        req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-        if creds:
-            req += f"Proxy-Authorization: Basic {base64.b64encode(creds.encode()).decode()}\r\n"
-        s.sendall((req + "\r\n").encode())
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            c = s.recv(4096)
-            if not c:
-                raise OSError("proxy closed during CONNECT")
-            buf += c
-        line = buf.split(b"\r\n", 1)[0].decode(errors="replace")
-        if " 200" not in line:
-            raise OSError(f"proxy CONNECT failed: {line}")
-        return s
-    if scheme in ("socks5", "socks5h"):
-        methods = b"\x02" if creds else b"\x00"
-        s.sendall(b"\x05\x01" + methods)
-        r = _recv_exact(s, 2)
-        if r[1] == 0xFF:
-            raise OSError("socks5 no acceptable auth")
-        if r[1] == 0x02:
-            ub = (u.username or "").encode()
-            pb = (u.password or "").encode()
-            s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
-            r = _recv_exact(s, 2)
-            if r[1] != 0x00:
-                raise OSError("socks5 auth failed")
-        if scheme == "socks5h":
-            # 远程 DNS：域名按 ATYP=0x03 直接交给代理解析
-            hb = host.encode()
-            s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack(">H", port))
-        else:
-            hb = socket.gethostbyname(host)
-            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(hb) + struct.pack(">H", port))
-        head = _recv_exact(s, 4)
-        if head[1] != 0x00:
-            raise OSError(f"socks5 connect failed rep={head[1]}")
-        atyp = head[3]
-        if atyp == 0x01:
-            _recv_exact(s, 4 + 2)  # IPv4 + port
-        elif atyp == 0x03:
-            ln = _recv_exact(s, 1)[0]
-            _recv_exact(s, ln + 2)
-        elif atyp == 0x04:
-            _recv_exact(s, 16 + 2)
-        return s
-    raise OSError(f"unsupported proxy scheme: {scheme}（支持 http:// socks5:// socks5h://）")
 
 
-def _bind_sport(rng: list[int] | tuple[int, int] | None) -> socket.socket | None:
-    """直连路径绑定 sport_range 内随机源端口（honk sport 分流用）。"""
-    if not rng:
-        return None
-    lo, hi = int(rng[0]), int(rng[1])
-    for _ in range(8):
-        s = socket.socket()
-        try:
-            s.bind(("0.0.0.0", random.randint(lo, hi)))
-            s.settimeout(20)
-            s.connect((UP_HOST, 443))
-            return s
-        except OSError:
-            try:
-                s.close()
-            except OSError:
-                pass
-    raise OSError(f"sport_range {lo}-{hi} 全部绑定失败")
 
 
-class UpstreamConn(http.client.HTTPSConnection):
-    """直连或经隧道的 HTTPS 连接；sock 由调用方预建。"""
-
-    def __init__(self, sock: socket.socket | None, timeout: int = 600):
-        super().__init__(UP_HOST, timeout=timeout)
-        self._preset = sock
-
-    def connect(self):
-        if self._preset is not None:
-            self.sock = _ssl_ctx.wrap_socket(self._preset, server_hostname=UP_HOST)
-        else:
-            super().connect()
 
 
-def upstream_request(a: "Account", path: str, body: bytes = b"", extra: dict | None = None,
-                     method: str = "POST", host: str | None = None, timeout: int = 600):
-    """proxy / sport 分流感知请求（sport 分流仅对 api.z.ai 生效）；
-    host 缺省时按账号 realm 选上游（global=api.z.ai / cn=open.bigmodel.cn）。
-    返回 (status, headers-dict, response)。"""
-    hdrs = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": UA}
-    if extra:
-        hdrs.update(extra)
-    host = host or UPSTREAMS.get(a.realm, UPSTREAMS["global"])["host"]
-    connect_timeout = float((POOL.server_cfg if POOL else DEFAULT_SERVER).get("connect_timeout", 20))
-    if a.proxy:
-        conn = UpstreamConn(open_tunnel(a.proxy, host=host, timeout=int(connect_timeout)), timeout=timeout)
-    elif a.sport_range and host == UP_HOST:
-        conn = UpstreamConn(_bind_sport(a.sport_range), timeout=timeout)
-    else:
-        conn = http.client.HTTPSConnection(host, timeout=timeout)
-    try:
-        conn.request(method, path, body=body if method == "POST" else None, headers=hdrs)
-        resp = conn.getresponse()
-        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp
-    except Exception:
-        conn.close()
-        raise
 
 
 # ==== domain: core（调度/状态机） ====
@@ -292,6 +168,7 @@ def upstream_request(a: "Account", path: str, body: bytes = b"", extra: dict | N
 
 # ---- 模块级全局句柄（main 装配；Phase6 拆包归属：POOL→core 运行态、STATE_FILE→storage、AUDIT_FILE→observability、PANEL_HTML→http、CFG_PATH→entry 装配） ----
 POOL: Pool | None = None
+set_pool_getter(lambda: POOL)  # Phase6 upstream 域注入（延迟读全局，测试赋值 mod.POOL 即生效）
 CFG_PATH = ""
 STATE_FILE = ""
 AUDIT_FILE = ""
