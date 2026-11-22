@@ -6,6 +6,7 @@
 """
 from __future__ import annotations  # 节点源码依赖 PEP 563（Pool.device_by_key 前向注解 Device）
 
+import base64
 import hashlib  # noqa: F401  计划书头部清单位，当前 core 节点未直接引用
 import json
 import os
@@ -137,13 +138,49 @@ def log(msg: str) -> None:
 
 
 # ---------- 账号与状态机 ----------
+def _jwt_payload(jwt: str) -> dict:
+    """JWT payload 段解码（base64url 无填充容忍）；失败返回空 dict。
+    单一所有权：upstream 域 derive_device_ids 复用，避免双份解码器漂移。"""
+    try:
+        return json.loads(base64.urlsafe_b64decode(jwt.split(".")[1] + "=="))
+    except Exception:
+        return {}
+
+
+def jwt_exp(jwt: str) -> int:
+    """JWT exp（epoch 秒）；缺 exp 段/解析失败返回 0（视为不过期，服务端 401 兜底）。"""
+    try:
+        return int(_jwt_payload(jwt).get("exp") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def derive_device_ids(jwt: str) -> tuple[str, str]:
+    """按账号恒定派生 device_id/session_id（angus 口径，防指纹漂移）。
+    单一所有权在 core（纯函数）；upstream 域与 Account.device_mid 兜底共用。"""
+    uid = str(_jwt_payload(jwt).get("user_id") or jwt[:16])
+    h = hashlib.md5(f"machine:{uid}".encode()).hexdigest()
+    device = f"{h[:12]}4{h[13:16]}a{h[17:]}"
+    session = "session_" + hashlib.sha256(f"session:{uid}".encode()).hexdigest()[:32]
+    return device, session
+
+
+def _derive_chat_mode(cfg: dict) -> tuple[str, bool]:
+    """chat_via 判定（Account.__init__ 与热重载共用）：显式 apikey/jwt；缺省 auto——
+    有 api_key 走 apikey 通道，仅持 zcode_jwt（免费套餐）走 jwt 通道。
+    chat_capable = 该通道是否有可用凭据；False = billing-only（只巡检/领取）。"""
+    cv = (cfg.get("chat_via") or "").strip().lower()
+    has_key = bool((cfg.get("api_key") or "").strip())
+    has_jwt = bool((cfg.get("zcode_jwt") or "").strip())
+    if cv not in ("apikey", "jwt"):
+        cv = "jwt" if (has_jwt and not has_key) else "apikey"
+    return cv, (has_jwt if cv == "jwt" else has_key)
+
+
 class Account:
     def __init__(self, cfg: dict):
         self.name = cfg["name"]
         self.key = (cfg.get("api_key") or "").strip()
-        # chat_capable=False = billing-only 账号（免费套餐无 API Key）：
-        # 不参与对话调度，仅 billing 巡检/领取（Phase5 适配免费套餐）
-        self.chat_capable = bool(self.key)
         self.realm = cfg.get("realm", "global")
         if self.realm not in UPSTREAMS:
             self.realm = "global"
@@ -152,6 +189,13 @@ class Account:
         self.expires = cfg.get("expires")
         self.zcode_jwt = (cfg.get("zcode_jwt") or "").strip()
         self.device_mid = (cfg.get("device_mid") or "").strip()
+        # 通道归属（Phase9 移植 zcode2api）：chat_via=jwt 账号参与对话调度，
+        # 走 zcode-plan anthropic 端点；chat_capable=False = billing-only
+        self.chat_via, self.chat_capable = _derive_chat_mode(cfg)
+        self.jwt_exp = jwt_exp(self.zcode_jwt) if self.zcode_jwt else 0
+        # device_mid 兜底：JWT 账号缺省时恒定派生（billing 缺它返回 3001，对话头族也要它）
+        if not self.device_mid and self.zcode_jwt:
+            self.device_mid = derive_device_ids(self.zcode_jwt)[0]
         self.max_in_flight = int(cfg.get("max_in_flight", 8))
         # 状态机字段（持久化）
         self.cool_until = 0.0
@@ -231,6 +275,12 @@ class Account:
              for x in self.billing.get("balances") or []]
         return _bal_exhausted(b)
 
+    def jwt_valid(self) -> bool:
+        """JWT 通道凭据时效：非 jwt 通道恒真；无 exp 视为有效（服务端 401 兜底）。"""
+        if self.chat_via != "jwt":
+            return True
+        return not self.jwt_exp or self.jwt_exp > time.time() + 30
+
 
 class Pool:
     def __init__(self, cfg: dict):
@@ -306,7 +356,16 @@ class Pool:
             w[a.name] = x
         return w
 
-    def pick(self, sticky_key: str, exclude: set[str], dev: "Device | None" = None) -> Account | None:
+    def pick(self, sticky_key: str, exclude: set[str], dev: "Device | None" = None,
+             jwt_ok: bool = True) -> Account | None:
+        # JWT 过期预清：过期即 1h auth 冷却（复用状态机计数/日志），不入本轮调度
+        now0 = time.time()
+        for a in self.accounts:
+            if (a.chat_via == "jwt" and a.chat_capable
+                    and not a.jwt_valid() and a.cool_until < now0):
+                self.cooldown(a, 401, "jwt expired")
+        # 协议过滤：jwt 通道仅服务 Anthropic 端点（zcode-plan 无 OpenAI 兼容路径）
+        chan_ok = (lambda a: True) if jwt_ok else (lambda a: a.chat_via != "jwt")
         # 设备分配子集（无分配 = 全池）；粘性与主用号都必须过此过滤（设备隔离）
         pool_names = set(dev.accounts) if dev and dev.accounts else None
         in_scope = (lambda a: True) if pool_names is None else (lambda a: a.name in pool_names)
@@ -321,14 +380,14 @@ class Pool:
                 else:
                     for a in self.accounts:
                         if (a.name == name and a.available() and a.name not in exclude
-                                and in_scope(a)):
+                                and in_scope(a) and chan_ok(a)):
                             self.sched["sticky_hits"] += 1
                             return a
                     self.sticky.pop(sticky_key, None)  # 失败解绑
                     self.sched["sticky_unbind"] += 1
         alive = [a for a in self.accounts
                  if a.available() and a.name not in exclude and not a.exhausted()
-                 and a.chat_capable and in_scope(a)]
+                 and a.chat_capable and in_scope(a) and chan_ok(a)]
         if not alive:
             return None
         now = time.time()
@@ -343,7 +402,8 @@ class Pool:
             # 主用号复用（设备级或池级）；必须仍在分配子集内
             for a in self.accounts:
                 if (a.name == primary_name and a.available() and a.name not in exclude
-                        and not a.exhausted() and a.chat_capable and in_scope(a)):
+                        and not a.exhausted() and a.chat_capable and in_scope(a)
+                        and chan_ok(a)):
                     a.last_picked = now
                     return a
             # 双段分配：新会话优先未被任何会话绑定的号

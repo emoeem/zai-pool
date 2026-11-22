@@ -51,6 +51,10 @@ class BillingClient:
     def current(self, account) -> dict | str:
         return self._call(account, "/billing/current")
 
+    def usage(self, account) -> dict | str:
+        """实时用量（借鉴 zcode2api fetch_quota 第三路；balance/current/usage 并行三端点之一）。"""
+        return self._call(account, "/usage")
+
     def preview(self, account) -> dict | str:
         return self._call(account, "/billing/preview")
 

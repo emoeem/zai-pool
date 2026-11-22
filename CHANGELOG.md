@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### 新增（Phase 9 JWT 对话通道接线，移植 zcode2api 实战能力）
+- JWT 对话通道端到端接线：`Account.chat_via`（缺省 auto：有 api_key→apikey，仅 zcode_jwt→jwt）按账号分流 `_relay`；免费套餐（无 API Key）账号从 billing-only 升级为可对话，走 `zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`
+- 3012 三要素落地：请求时注入官方 system 提示词（`zcode-profile.json`，config 开关 `jwt_inject_profile` 默认开）+ `x-device-mid`/`x-session-id` 按 JWT user_id 恒定派生 + 完整客户端头族；`X-Aliyun-Captcha-Verify-Param` 预取
+- `zai_pool/captcha.py` CaptchaManager（同步版）：client/configs 拉取（600s TTL，失败回落默认三参）+ verify_param 45s 缓存/threading 单飞 + 403 captcha 失效同号重试≤3（不冷却账号）；求解只走 playwright headed 子进程（jsdom 无头被风控判 F001，不移植）
+- 模型名归一化 `MODEL_NAME_MAP`（含 glm-5.3-flash→GLM-5.3-Flash）+ `/v1/models` 在 jwt-only 池本地公布清单
+- billing 域补 `/usage` 实时用量（inspect 并入 `usage` 段，进 /status 与 zaipool_billing_usage_present 指标）
+- OAuth CLI 登录：`POST /admin/jwt/login_start` + `GET /admin/jwt/login_poll/{flow_id}`（ready → JWT+API Key 入 pool.json + 热重载），新账号自助入库
+- JWT 过期预清：payload exp 解析，过期账号 pick 前 1h auth 冷却不入调度；热重载同步 chat_via/jwt_exp/device_mid
+- 迁移脚本 `scripts/import_zcode2api.py`：zcode2api SQLite 账号库 → pool.json（dry-run 默认，--write 落盘 chmod 600）
+- 修复三处 latent bug：upstream.py `import json as _json` 致官方 system 提示词/设备派生永远走静默 fallback；reload_config 对无 api_key 账号 KeyError（热重载静默失败）；billing 3001（无 device_mid 的 JWT 账号现在构造时自动派生兜底）
+- 测试：92 用例全绿（新增 tests/test_jwt_relay.py 16 例，覆盖 chat_via 推导/归一化/captcha 重试与上限/402 冷却/OpenAI 协议隔离/models 本地清单/usage 解析/迁移解析）；实测流式+非流式 `/v1/messages` 200（GLM-5.3-Flash）
+
 ### 新增（Phase 6 模块化 + Phase 7 管理安全）
 - `zai_pool/observability.py`：metrics 台账 + 告警三态机独立成域（POOL/LEDGER getter 注入）
 - 管理端点：单账号探活 `POST /admin/accounts/{n}/probe`（零额度）、只读巡检 `/billing-check`、领取台账 `GET /billing/ledger`

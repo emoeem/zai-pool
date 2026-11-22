@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from billing.client import BillingClient
 from billing.models import ClaimOutcome
 from billing.parser import (BillingParseError, parse_balance, parse_claim_response,
-                            parse_plans)
+                            parse_plans, parse_usage)
 from billing.tracker import BillingLedger
 
 CST = timezone(timedelta(hours=8))
@@ -53,6 +53,12 @@ class BillingAdapter:
                                 for p in parse_plans(cur)]
             except BillingParseError:
                 out["plans"] = []
+        us = self.client.usage(account)  # 实时用量：失败不拖垮巡检主路径
+        if isinstance(us, dict) and us.get("code") == 0:
+            try:
+                out["usage"] = parse_usage(us)
+            except BillingParseError:
+                pass
         return out
 
     # ---------- 领取状态机 ----------

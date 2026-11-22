@@ -74,6 +74,13 @@ def parse_plans(payload: dict) -> list[dict]:
     return [p for p in plans if isinstance(p, dict)]
 
 
+def parse_usage(payload: Any) -> dict:
+    """/usage 响应 → data 段原样透传（上游字段不固定，结构宽容只验外壳）。"""
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        raise BillingParseError("usage 响应缺 data 段")
+    return payload["data"]
+
+
 def parse_claim_response(payload: Any) -> dict:
     """claim 响应必须可识别业务码（code==0 或明确的 already 语义），否则抛错。"""
     if not isinstance(payload, dict):

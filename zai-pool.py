@@ -83,12 +83,16 @@ from billing.policy import exhausted as _bal_exhausted, token_ratio as _bal_rati
 from billing.tracker import BillingLedger     # noqa: E402
 # ==== Phase6 core 域搬移（try2）：单一所有权在 zai_pool/core.py，re-import 保证下游引用不变 ====
 # UPSTREAMS 族与 MAX_BODY_BYTES 属 re-export：upstream/http 域引用保持可用
-from zai_pool.upstream import (UA, _bind_sport, _recv_exact, _ssl_ctx, open_tunnel,  # noqa: E402
-                           set_pool_getter, upstream_request, UpstreamConn)
+from zai_pool.upstream import (UA, _bind_sport, _recv_exact, _ssl_ctx, derive_device_ids,  # noqa: E402
+                           jwt_chat_request, MODEL_NAME_MAP, normalize_jwt_body, oauth_cli_init,
+                           oauth_cli_poll, oauth_exchange_api_key, open_tunnel, set_pool_getter,
+                           upstream_request, UpstreamConn, zcode_profile_system)
+from zai_pool.captcha import CAPTCHA, init_captcha  # noqa: E402  captcha 管理器（Phase9 移植）
 from zai_pool.core import (  # noqa: E402  core 域节点搬移，re-export 回流
     CST, DEFAULT_SERVER, DANGEROUS_KEYS, MAX_BODY_BYTES, SSEUsageParser, TokenBucket,
     UPSTREAMS, UP_ANTHROPIC_PATH, UP_HOST, UP_OPENAI_PATH,
-    Account, Device, Pool, _expires_ts, _sched_lock, _state_lock,
+    Account, Device, Pool, _derive_chat_mode, _expires_ts, _jwt_payload, _sched_lock,
+    _state_lock, jwt_exp,
     log, next_reset, now_cst, validate_security,
 )
 # ==== 共享常量区（单一所有权：core 域常量已迁 zai_pool/core.py，经下方 re-import 回流） ====
@@ -102,6 +106,15 @@ BILLING_APP_VERSION = "3.16.3"
 # http 域：_relay 错误分类使用（Phase6 随 http 域迁移）
 # 换号也无益的客户端错误：原样透传，不进入冷却/熔断状态机
 PASS_THROUGH_STATUS = {400, 404, 405, 413, 422}
+# http 域：captcha 失效判定（借鉴 zcode2api gateway._try_account 关键词法）
+CAPTCHA_ERR_MARKS = ("captcha", "3012", "verify")
+MAX_CAPTCHA_RETRIES = 3
+
+
+def _captcha_err(err_text: str) -> bool:
+    """上游 401/403 是否为 captcha 验证失败（verify_param 过期/3012）：非账号问题，不冷却。"""
+    low = (err_text or "").lower()
+    return any(m in low for m in CAPTCHA_ERR_MARKS)
 
 
 # http 域：有界 HTTP 服务器（连接/SSE 配额，main 装配，Phase6 随 http 迁移）
@@ -173,6 +186,9 @@ set_pool_getter(lambda: POOL)  # Phase6 upstream 域注入（延迟读全局，�
 CFG_PATH = ""
 STATE_FILE = ""
 AUDIT_FILE = ""
+# http 域：JWT OAuth 登录流程（Phase9 移植 zcode2api ZaiAuthFlow；poll_token 只存服务端）
+_JWT_LOGIN_FLOWS: dict[str, tuple[str, float, str]] = {}
+_JWT_LOGIN_FLOW_TTL = 600
 PANEL_HTML = "<html><body>panel not loaded</body></html>"
 # ==== Phase6 storage 域搬移（try2）：单一所有权在 zai_pool/storage.py，本文件 re-export/薄包装回流，relay/admin 调用点零改动 ====
 # 句柄注入（原全局变量赋值处）：getter 延迟求值——main 与测试对 POOL/STATE_FILE/AUDIT_FILE 的
@@ -425,14 +441,17 @@ def reload_config() -> None:
         old = {a.name: a for a in POOL.accounts}
         merged = []
         for name, acfg in new_keys.items():
-            if name in old and old[name].key == acfg["api_key"]:
+            if name in old and old[name].key == (acfg.get("api_key") or ""):
                 a = old[name]  # 保留运行态，但全部可热更字段同步
                 a.proxy = (acfg.get("proxy") or "").strip()
                 a.sport_range = acfg.get("sport_range")
                 a.expires = acfg.get("expires")
                 a.realm = acfg.get("realm", a.realm)
                 a.zcode_jwt = (acfg.get("zcode_jwt") or "").strip()
-                a.device_mid = (acfg.get("device_mid") or "").strip()
+                a.device_mid = ((acfg.get("device_mid") or "").strip()
+                                or (derive_device_ids(a.zcode_jwt)[0] if a.zcode_jwt else ""))
+                a.chat_via, a.chat_capable = _derive_chat_mode(acfg)  # 通道归属热更（billing-only ↔ jwt）
+                a.jwt_exp = jwt_exp(a.zcode_jwt) if a.zcode_jwt else 0
                 a.max_in_flight = int(acfg.get("max_in_flight", a.max_in_flight))
             else:
                 a = Account(acfg)
@@ -516,6 +535,11 @@ def metrics_text() -> str:
     for d in POOL.devices:
         t = d.usage.get(today, {})
         lines.append(f'zaipool_device_tokens_out_total{{device="{d.name}"}} {t.get("out", 0)}')
+    lines.append("# HELP zaipool_billing_usage_present 账号 /usage 实时用量在巡检结果中存在")
+    lines.append("# TYPE zaipool_billing_usage_present gauge")
+    for a in POOL.accounts:
+        if a.billing.get("usage") is not None:
+            lines.append(f'zaipool_billing_usage_present{{account="{a.name}"}} 1')
     lines.append("# HELP zaipool_sched_sticky_hits_total 粘性命中")
     lines.append("# TYPE zaipool_sched_sticky_hits_total counter")
     lines.append(f'zaipool_sched_sticky_hits_total {POOL.sched["sticky_hits"]}')
@@ -587,10 +611,15 @@ class Handler(BaseHTTPRequestHandler):
             dev = POOL.device_by_key(auth) if auth else None
             if not dev and not self._authed():
                 return self._json(401, {"error": "unauthorized"})
+            # JWT-only 池（免费套餐无 API Key）：本地公布模型清单，不走上游代理
+            if not any(a.chat_via == "apikey" and a.key for a in POOL.accounts):
+                names = sorted(set(MODEL_NAME_MAP.values()))
+                return self._json(200, {"data": [{"type": "model", "id": m, "display_name": m}
+                                                 for m in names]})
             last = "-"
             for _ in range(max(1, POOL.max_retry)):
                 with _sched_lock:
-                    acc = POOL.pick("", set(), dev=dev)
+                    acc = POOL.pick("", set(), dev=dev, jwt_ok=False)  # models 代理仅 apikey 通道
                     if acc:
                         acc.in_flight += 1
                 if not acc:
@@ -608,6 +637,13 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     acc.in_flight -= 1
             return self._json(502, {"error": f"no usable account for models; last={last}"})
+        if self.path.startswith("/admin/jwt/login_poll/") and POOL.admin_cfg.get("enabled"):
+            if not self._authed():
+                return self._json(401, {"error": "unauthorized"})
+            if not POOL.admin_bucket.allow():
+                return self._json(429, {"error": {"message": "admin rate limit exceeded",
+                                                  "type": "admin_rate_limited"}})
+            return self._jwt_login_poll(self.path.rstrip("/").rsplit("/", 1)[-1])
         if self.path == "/status":
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
@@ -623,10 +659,12 @@ class Handler(BaseHTTPRequestHandler):
                     "exit": f"{p.scheme}://{p.hostname}:{p.port}" if p
                             else (f"sport {sr[0]}-{sr[1]}" if sr else "direct"),
                     "expires": a.expires,
-                    "billing": {k: a.billing.get(k) for k in ("balances", "plans") if a.billing.get(k)},
+                    "billing": {k: a.billing.get(k) for k in ("balances", "plans", "usage")
+                                if a.billing.get(k)},
                     "today": a.usage.get(now_cst().strftime("%Y-%m-%d"), {}),
                     "primary": a.name == POOL._primary,
                     "has_jwt": bool(a.zcode_jwt),
+                    "chat_via": a.chat_via,
                 })
             return self._json(200, {"accounts": out, "reset_hour": POOL.reset_hour,
                                     "strategy": POOL.strategy, "primary": POOL._primary,
@@ -676,6 +714,55 @@ class Handler(BaseHTTPRequestHandler):
         return out
         self._json(404, {"error": "not found"})
 
+    def _jwt_login_poll(self, fid: str):
+        """OAuth 轮询（GET/POST /admin/jwt/login_poll/{flow_id}）：ready → 账号入池。"""
+        ent = _JWT_LOGIN_FLOWS.get(fid)
+        if not fid or not ent:
+            return self._json(404, {"error": "flow 不存在（先 POST /admin/jwt/login_start）"})
+        poll_token, started, custom_name = ent
+        if time.time() - started > _JWT_LOGIN_FLOW_TTL:
+            _JWT_LOGIN_FLOWS.pop(fid, None)
+            return self._json(410, {"error": "flow 已超时，重新 login_start"})
+        try:
+            data = oauth_cli_poll(fid, poll_token)
+        except Exception as e:
+            return self._json(502, {"error": f"poll 失败: {type(e).__name__}: {e}"})
+        status = data.get("status")
+        if status != "ready":
+            if status == "failed":
+                _JWT_LOGIN_FLOWS.pop(fid, None)
+            return self._json(200, {"status": status or "pending"})
+        _JWT_LOGIN_FLOWS.pop(fid, None)
+        zcode_jwt = (data.get("token") or "").strip()
+        if not zcode_jwt:
+            return self._json(502, {"error": "ready 但缺 token 段", "data_keys": sorted(data.keys())})
+        uid = str(_jwt_payload(zcode_jwt).get("user_id") or fid[:8])
+        acc_name = custom_name or f"zcode-{uid[:8]}"
+        api_key = ""
+        access_token = ((data.get("zai") or {}).get("access_token") or "")
+        if access_token:
+            try:
+                api_key = oauth_exchange_api_key(access_token)
+            except Exception as e:
+                log(f"[oauth] API key 兑换失败（仅入 JWT）: {type(e).__name__}: {e}")
+        entry = {"name": acc_name, "zcode_jwt": zcode_jwt, "chat_via": "jwt", "realm": "global"}
+        if api_key:
+            entry["api_key"] = api_key  # 备用通道凭据；chat_via=jwt 优先走 zcode-plan 权益
+        try:
+            cfg = json.loads(Path(CFG_PATH).read_text())
+            if any(x.get("name") == acc_name for x in cfg.get("accounts") or []):
+                return self._json(200, {"status": "exists", "name": acc_name})
+            cfg["accounts"] = list(cfg.get("accounts") or []) + [entry]
+            Path(CFG_PATH).write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+            os.chmod(CFG_PATH, 0o600)
+        except OSError as e:
+            return self._json(500, {"error": f"pool.json 写回失败: {e}"})
+        reload_config()
+        audit("jwt_login", acc_name, "ok", key_fp(sorted(POOL.api_keys)[0]),
+              f"api_key={'yes' if api_key else 'no'}")
+        log(f"[oauth] {acc_name} 入池（api_key={'yes' if api_key else 'no'}）")
+        return self._json(200, {"status": "ok", "name": acc_name, "api_key": bool(api_key)})
+
     def _relay(self, upstream_path: str, protocol: str):
         auth = (self.headers.get("Authorization") or "").replace("Bearer ", "").strip()
         dev = POOL.device_by_key(auth) if auth else None
@@ -712,17 +799,28 @@ class Handler(BaseHTTPRequestHandler):
         _seq[0] += 1
         seq = _seq[0]
         sse_entered = False  # SSE 配额跨 attempt 释放标志
+        jwt_ok = protocol == "anthropic"  # zcode-plan 端点仅 Anthropic 协议；OpenAI 请求只用 apikey 号
+        cap_retries = 0
 
         for _ in range(max(1, POOL.max_retry)):
             # 原子租约：选号与槽位预留同一临界区，杜绝并发超卖
             with _sched_lock:
-                a = POOL.pick(sk, tried, dev=dev)
+                a = POOL.pick(sk, tried, dev=dev, jwt_ok=jwt_ok)
                 if a:
                     a.in_flight += 1
             if not a:
                 break
             tried.add(a.name)
             a.stats["req"] += 1
+            # JWT 通道（Phase9）：模型归一化 + 官方 system 注入 + verify_param 预取
+            req_body = body
+            verify_param = None
+            if a.chat_via == "jwt":
+                req_body = json.dumps(normalize_jwt_body(
+                    req, inject_profile=bool(POOL.server_cfg.get("jwt_inject_profile", True)))).encode()
+                verify_param = CAPTCHA.get_verify_param()
+                if not verify_param:
+                    log(f"[captcha] {a.name} verify_param 缺失，仍发送（预期 3012）")
             extra = {"Authorization": f"Bearer {a.key}"} if protocol == "openai" else {"x-api-key": a.key}
             if protocol == "anthropic":
                 for h in ("anthropic-version", "anthropic-beta"):
@@ -733,13 +831,26 @@ class Handler(BaseHTTPRequestHandler):
                        else float(POOL.server_cfg.get("request_timeout", 300)))
             try:
                 try:
-                    status, rh, resp = upstream_request(a, upstream_path, body, extra, timeout=timeout)
+                    if a.chat_via == "jwt":
+                        status, rh, resp = jwt_chat_request(a, req_body, verify_param, timeout=timeout)
+                    else:
+                        status, rh, resp = upstream_request(a, upstream_path, req_body, extra, timeout=timeout)
                 except (OSError, http.client.HTTPException) as e:
                     POOL.note_unknown_fail(a)
                     last_err = f"{type(e).__name__}: {e}"
                     continue
                 if status != 200:
                     err = resp.read()[:400].decode(errors="replace")
+                    # captcha 失效（verify_param 过期/3012）：非账号问题——失效重取后同号重试，不冷却
+                    if (status in (401, 403) and cap_retries < MAX_CAPTCHA_RETRIES
+                            and _captcha_err(err)):
+                        cap_retries += 1
+                        CAPTCHA.invalidate()
+                        tried.discard(a.name)  # 不占换号名额：同号可再选（verify_param 已刷新）
+                        log(f"[captcha] {a.name} http={status} 验证失效 → 重取重试 "
+                            f"{cap_retries}/{MAX_CAPTCHA_RETRIES}")
+                        last_err = f"{status} captcha"
+                        continue
                     # 错误分类：请求本身有错（换号也无益）→ 原样透传客户端，不冷却账号
                     if status in PASS_THROUGH_STATUS:
                         raw = err.encode()
@@ -838,6 +949,26 @@ class Handler(BaseHTTPRequestHandler):
                                                   "type": "admin_rate_limited"}})
             parts = m.strip("/").split("/")
             name, action = parts[2], parts[3] if len(parts) > 3 else ""
+            # ---- jwt OAuth 登录（Phase9 移植 zcode2api ZaiAuthFlow） ----
+            # 注意段数：/admin/jwt/login_start 为 3 段（name=jwt, action 落空），按整路径匹配
+            if m.rstrip("/") == "/admin/jwt/login_start":
+                custom_name = ""
+                try:
+                    _n = int(self.headers.get("Content-Length") or 0)
+                    custom_name = str((json.loads(self.rfile.read(_n) or b"{}") or {}).get("name") or "")
+                except Exception:
+                    custom_name = ""
+                try:
+                    flow_id, authorize_url, poll_token = oauth_cli_init()
+                except Exception as e:
+                    return self._json(502, {"error": f"oauth init 失败: {type(e).__name__}: {e}"})
+                _JWT_LOGIN_FLOWS[flow_id] = (poll_token, time.time(), custom_name)
+                audit("jwt_login_start", flow_id, "ok", key_fp(sorted(POOL.api_keys)[0]))
+                log(f"[oauth] flow={flow_id[:12]}… 已发起，等待浏览器授权")
+                return self._json(200, {"flow_id": flow_id, "authorize_url": authorize_url,
+                                        "poll": f"/admin/jwt/login_poll/{flow_id}"})
+            if name == "jwt" and action == "login_poll":
+                return self._jwt_login_poll(parts[4] if len(parts) > 4 else "")
             n = int(self.headers.get("Content-Length") or 0)
             reason = ""
             try:
@@ -984,6 +1115,10 @@ def run_probe(chat: bool) -> int:
     for a in POOL.accounts:
         tag = f"{a.name:<10}"
         exit_ip = "-"
+        if a.chat_via == "jwt":
+            # jwt 通道无 api.z.ai key：KEY 探测无意义，跳过（billing 巡检走 --billing）
+            print(f"{tag} JWT-ONLY  chat_via=jwt expires={a.expires or '-'}")
+            continue
         try:
             st, _, resp = upstream_request(a, MODELS_PATH, method="GET", timeout=30)
             raw = resp.read()
@@ -1122,6 +1257,7 @@ def main() -> int:
             raise SystemExit(f"[audit] 审计文件不可写: {e}")
     ALERTER = Alerter(POOL.alert_cfg)
     load_panel()
+    init_captcha(POOL.server_cfg)  # captcha 管理器按 server 段装配（Phase9）
 
     host, _, port = cfg.get("listen", "127.0.0.1:8602").rpartition(":")
     srv = BoundedServer((host or "0.0.0.0", int(port)), Handler, POOL.server_cfg)
@@ -1163,7 +1299,7 @@ def main() -> int:
         p = urllib.parse.urlparse(acc.proxy) if acc.proxy else None
         log(f"  - {acc.name}[{acc.realm}] expires={acc.expires or '-'} "
             f"exit={p.hostname + ':' + str(p.port) if p else (('sport ' + str(acc.sport_range)) if acc.sport_range else 'direct')} "
-            f"jwt={'yes' if acc.zcode_jwt else 'no'}")
+            f"jwt={'yes' if acc.zcode_jwt else 'no'} chat_via={acc.chat_via}")
     for d in POOL.devices:
         log(f"  dev {d.name} accounts={d.accounts or '(全池)'}")
     try:

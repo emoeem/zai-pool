@@ -5,7 +5,11 @@ POOL 通过 set_pool_getter 注入（避免 entry↔包循环导入）；UPSTREA
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
+import random
 import urllib.parse
+from pathlib import Path
 from typing import Callable
 import http.client
 import socket
@@ -13,7 +17,8 @@ import ssl
 import struct
 from urllib.parse import urlparse
 
-from zai_pool.core import DEFAULT_SERVER, UP_HOST, UP_OPENAI_PATH, UPSTREAMS
+from zai_pool.core import (DEFAULT_SERVER, UP_HOST, UP_OPENAI_PATH, UPSTREAMS,
+                           _jwt_payload, derive_device_ids, jwt_exp)  # noqa: 私有名跨域复用（单一所有权）
 
 POOL_GETTER: Callable | None = None  # 由 entry 注入 lambda: POOL
 
@@ -162,3 +167,173 @@ def upstream_request(a: "Account", path: str, body: bytes = b"", extra: dict | N
         conn.close()
         raise
 
+
+
+# ---------- JWT 对话通道（免费套餐；Phase4 审查结论修订：3012 三要素已破解） ----------
+_PROFILE_PATH = Path(__file__).resolve().parents[1] / "zcode-profile.json"
+_profile_cache: dict | None = None
+
+
+def zcode_profile_system() -> list | None:
+    """ZCode 官方 system 提示词（3012 判定点之一）；缓存加载。"""
+    global _profile_cache
+    if _profile_cache is None:
+        try:
+            _profile_cache = json.loads(_PROFILE_PATH.read_text()).get("system")
+        except Exception:
+            _profile_cache = None
+    return _profile_cache
+
+
+# ---------- JWT 通道请求体归一化（借鉴 zcode2api _normalize_body；补 GLM-5.3-Flash） ----------
+MODEL_NAME_MAP = {
+    "glm-5.3-flash": "GLM-5.3-Flash",
+    "glm-5.2": "GLM-5.2",
+    "glm-5-turbo": "GLM-5-Turbo",
+    "glm-turbo": "GLM-5-Turbo",
+    "glm-5.1": "GLM-5.1",
+    "glm-4.7": "GLM-4.7",
+}
+
+
+def normalize_jwt_body(req: dict, inject_profile: bool = True) -> dict:
+    """JWT 通道请求体预处理：模型名大小写映射（上游大小写敏感）+
+    客户端未带 system 时注入官方 system 提示词（3012 判定点之一）。"""
+    out = dict(req)
+    m = str(out.get("model") or "").strip()
+    if m:
+        out["model"] = MODEL_NAME_MAP.get(m.lower(), m)
+    if inject_profile and not out.get("system"):
+        prof = zcode_profile_system()
+        if prof:
+            out["system"] = prof
+    return out
+
+
+# ---------- OAuth CLI 登录（移植 zcode2api ZaiAuthFlow，stdlib 版） ----------
+def oauth_cli_init(provider: str = "zai") -> tuple[str, str, str]:
+    """发起 OAuth CLI 流程。返回 (flow_id, authorize_url, poll_token)。"""
+    import secrets
+    poll_token = secrets.token_hex(32)
+    body = json.dumps({"provider": provider}).encode()
+    req = http.client.HTTPSConnection("zcode.z.ai", timeout=30)
+    try:
+        req.request("POST", "/api/v1/oauth/cli/init", body=body, headers={
+            "Authorization": f"Bearer {poll_token}",
+            "Content-Type": "application/json", "Accept": "application/json"})
+        resp = req.getresponse()
+        data = json.loads(resp.read()).get("data") or {}
+    finally:
+        req.close()
+    flow_id, authorize_url = data.get("flow_id"), data.get("authorize_url")
+    if not flow_id or not authorize_url:
+        raise RuntimeError(f"OAuth init 返回不完整: {str(data)[:120]}")
+    return flow_id, authorize_url, poll_token
+
+
+def oauth_cli_poll(flow_id: str, poll_token: str) -> dict:
+    """轮询 OAuth 流程。data.status=ready 时含 token（zcode JWT）与 zai.access_token。"""
+    req = http.client.HTTPSConnection("zcode.z.ai", timeout=30)
+    try:
+        req.request("GET", f"/api/v1/oauth/cli/poll/{flow_id}", headers={
+            "Authorization": f"Bearer {poll_token}", "Accept": "application/json"})
+        resp = req.getresponse()
+        return json.loads(resp.read()).get("data") or {}
+    finally:
+        req.close()
+
+
+def oauth_exchange_api_key(access_token: str) -> str:
+    """OAuth access_token → 业务 token → 默认机构/项目 → 复制/创建 zcode-api-key。
+    返回 "apiKey.secretKey"；免费套餐可能无权创建，失败抛异常由调用方隔离。"""
+    conn = http.client.HTTPSConnection("api.z.ai", timeout=30)
+    try:
+        conn.request("POST", "/api/auth/z/login", body=json.dumps({"token": access_token}).encode(),
+                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        biz = (json.loads(conn.getresponse().read()).get("data") or {})
+        biz_token = biz.get("access_token") or biz.get("accessToken")
+        if not biz_token:
+            raise RuntimeError("z/login 返回数据中不含业务凭证")
+        conn.request("GET", "/api/biz/customer/getCustomerInfo",
+                     headers={"Authorization": f"Bearer {biz_token}", "Accept": "application/json"})
+        orgs = (json.loads(conn.getresponse().read()).get("data") or {}).get("organizations") or []
+        org = next((o for o in orgs if "默认机构" in (o.get("organizationName") or "")), None) \
+            or (orgs[0] if orgs else None)
+        if not org:
+            raise RuntimeError("找不到可用的机构")
+        projects = org.get("projects") or []
+        proj = next((p for p in projects if "默认项目" in (p.get("projectName") or "")), None) \
+            or (projects[0] if projects else None)
+        if not proj:
+            raise RuntimeError("找不到可用的项目")
+        key_path = (f"/api/biz/v1/organization/{org['organizationId']}"
+                    f"/projects/{proj['projectId']}/api_keys")
+        conn.request("GET", key_path,
+                     headers={"Authorization": f"Bearer {biz_token}", "Accept": "application/json"})
+        keys = json.loads(conn.getresponse().read()).get("data") or []
+        key_obj = next((k for k in keys if k.get("name") == "zcode-api-key"), None)
+        if not key_obj:
+            conn.request("POST", key_path, body=json.dumps({"name": "zcode-api-key"}).encode(),
+                         headers={"Authorization": f"Bearer {biz_token}",
+                                  "Content-Type": "application/json", "Accept": "application/json"})
+            key_obj = json.loads(conn.getresponse().read()).get("data")
+        api_key = (key_obj or {}).get("apiKey")
+        if not api_key:
+            raise RuntimeError("获取 API Key 失败")
+        conn.request("GET", f"{key_path}/copy/{api_key}",
+                     headers={"Authorization": f"Bearer {biz_token}", "Accept": "application/json"})
+        secret_key = (json.loads(conn.getresponse().read()).get("data") or {}).get("secretKey")
+        if not secret_key:
+            raise RuntimeError("未能解密 Secret Key")
+    finally:
+        conn.close()
+    return f"{api_key}.{secret_key}"
+
+
+def jwt_chat_request(a, body: bytes, verify_param: str | None, timeout: float = 90):
+    """JWT 对话：zcode-plan anthropic 端点 + 全客户端头族 + metadata.user_id。
+    返回 (status, headers, response)。verify_param 为空时不带验证码头（会 3012）。"""
+    import uuid as _uuid
+    device_id, session_id = derive_device_ids(a.zcode_jwt)
+    app_version = "3.16.3"
+    headers = {
+        "authorization": f"Bearer {a.zcode_jwt}",
+        "x-api-key": a.zcode_jwt,
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "mid-conversation-system-2026-04-07",
+        "user-agent": f"ZCode/{app_version} ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
+        "http-referer": "https://zcode.z.ai",
+        "x-zcode-app-version": app_version,
+        "x-title": "Z Code@electron",
+        "x-release-channel": "production",
+        "x-platform": "linux-x64",
+        "x-os-category": "linux",
+        "x-os-version": "5.15.0",
+        "x-client-timezone": "Asia/Shanghai",
+        "x-client-language": "zh-CN",
+        "x-device-mid": device_id,
+        "x-session-id": session_id,
+        "x-query-id": str(_uuid.uuid4()),
+        "x-request-id": _uuid.uuid4().hex,
+        "x-zcode-trace-id": str(_uuid.uuid4()),
+        "x-zcode-agent": "glm",
+        "x-zcode-query-source": "main_turn",
+        "x-zcode-session-type": "main",
+        "accept": "text/event-stream, application/json",
+    }
+    if verify_param:
+        headers["x-aliyun-captcha-verify-param"] = verify_param
+    host = "zcode.z.ai"
+    if a.proxy:
+        conn = UpstreamConn(open_tunnel(a.proxy, host=host), timeout=timeout)
+    else:
+        conn = http.client.HTTPSConnection(host, timeout=timeout)
+    try:
+        conn.request("POST", UP_OPENAI_PATH.replace("/api/coding", "") and "/api/v1/zcode-plan/anthropic/v1/messages",
+                     body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp
+    except Exception:
+        conn.close()
+        raise

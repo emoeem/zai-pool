@@ -4,6 +4,7 @@ zai-pool-data/pool-state.json
 zai-pool-data/admin_audit.log
 zai-pool-data/server.log
 zai-pool-data/honk-rules.dae
+zai-pool-data/billing-ledger.jsonl
 zai-pool-data/*.log
 *-state.json
 *.log
